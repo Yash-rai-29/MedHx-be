@@ -26,7 +26,7 @@
   },
   "audio_consultation": {
     "default_title": "Consultation analysis ready 🩺",
-    "default_body": "Hi {patient_first_name}, your recording has been analysed. Tap to view the summary.",
+    "default_body": "Hi {patient_first_name}, your consultation recording has been analysed. Tap to view your summary.",
     "deeplink_template": "/consultations/audio/{consultation_id}"
   },
   "general": {

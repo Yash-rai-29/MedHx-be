@@ -290,10 +290,24 @@ async def background_process_audio_consultation(
             "error_message":        None,
         })
         logger.info(f"Audio consultation {consultation_id} processed successfully.")
+
+        # Build a specific body from the extracted data we already have
+        _parts = []
+        if medicines:
+            _parts.append(f"{len(medicines)} medicine{'s' if len(medicines) != 1 else ''}")
+        if key_diagnoses:
+            _parts.append(f"{len(key_diagnoses)} {'diagnoses' if len(key_diagnoses) != 1 else 'diagnosis'}")
+        if follow_ups:
+            _parts.append("follow-up advice")
+        _insight = (", ".join(_parts) + " identified") if _parts else "summary ready"
+
+        # {patient_first_name} is substituted by the dispatcher via format_safe
+        _notif_body = "Hi {patient_first_name}, your consultation has been analysed — " + _insight + ". Tap to view."
+
         await dispatch_notification(
             patient_id=uid,
-            title=None,
-            body=None,
+            title=None,   # uses template default: "Consultation analysis ready 🩺"
+            body=_notif_body,
             notification_type="audio_consultation",
             extra_data={"consultation_id": consultation_id},
         )
