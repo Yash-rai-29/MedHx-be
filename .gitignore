@@ -1,0 +1,176 @@
+# ============================================================
+# AI-Health Project — .gitignore
+# ============================================================
+
+# ------------------------------------------------------------
+# Environment & Secrets
+# ------------------------------------------------------------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.json.secret
+service-account*.json
+gcp-credentials*.json
+firebase-adminsdk*.json
+credentials*.json
+
+# ------------------------------------------------------------
+# Python
+# ------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+eggs/
+parts/
+var/
+sdist/
+develop-eggs/
+.installed.cfg
+lib/
+lib64/
+MANIFEST
+
+# ------------------------------------------------------------
+# Virtual Environments
+# ------------------------------------------------------------
+.venv/
+venv/
+env/
+ENV/
+.env/
+virtualenv/
+.Python
+
+# ------------------------------------------------------------
+# Testing & Coverage
+# ------------------------------------------------------------
+.pytest_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+nosetests.xml
+pytest.ini.local
+*.log
+test-results/
+
+# ------------------------------------------------------------
+# Jupyter / IPython
+# ------------------------------------------------------------
+.ipynb_checkpoints/
+*.ipynb
+
+# ------------------------------------------------------------
+# Type Checkers & Linters
+# ------------------------------------------------------------
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pyre/
+.pytype/
+.ruff_cache/
+
+# ------------------------------------------------------------
+# Docker
+# ------------------------------------------------------------
+.dockerignore
+docker-compose.override.yml
+
+# ------------------------------------------------------------
+# GCP / Firebase
+# ------------------------------------------------------------
+.gcloudignore
+*.tfstate
+*.tfstate.backup
+.terraform/
+terraform.tfvars
+terraform.tfvars.json
+
+# ------------------------------------------------------------
+# IDE & Editors
+# ------------------------------------------------------------
+# VS Code
+.vscode/
+*.code-workspace
+
+# JetBrains (PyCharm, IntelliJ, etc.)
+.idea/
+*.iml
+*.iws
+*.ipr
+
+# Vim / Neovim
+*.swp
+*.swo
+*~
+.netrwhist
+
+# Emacs
+*#
+.\#*
+.dir-locals.el
+
+# Sublime Text
+*.sublime-project
+*.sublime-workspace
+
+# Xcode (Mac)
+*.xcuserstate
+
+# ------------------------------------------------------------
+# macOS
+# ------------------------------------------------------------
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+Icon?
+.fseventsd
+.TemporaryItems
+.VolumeIcon.icns
+
+# ------------------------------------------------------------
+# Linux
+# ------------------------------------------------------------
+*~
+
+# ------------------------------------------------------------
+# Windows
+# ------------------------------------------------------------
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# ------------------------------------------------------------
+# Logs & Temp Files
+# ------------------------------------------------------------
+*.log
+*.tmp
+*.temp
+*.pid
+*.seed
+*.bak
+*.orig
+logs/
+tmp/
+temp/
+
+# ------------------------------------------------------------
+# Build Artifacts
+# ------------------------------------------------------------
+*.whl
+*.tar.gz
+*.zip
+site/
+docs/_build/
