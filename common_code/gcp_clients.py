@@ -380,6 +380,39 @@ async def async_generate_gemini_content(prompt: str, json_response: bool = False
     return await asyncio.to_thread(generate_gemini_content, prompt, json_response, model)
 
 
+async def stream_gemini_content(prompt: str, model: str | None = None):
+    """
+    Async generator that yields text chunks from Gemini as they arrive.
+    Bridges the sync SDK streaming iterator to an async generator via a thread + asyncio.Queue.
+    Yields empty string sentinel (None) on completion.
+    """
+    import threading
+
+    client     = _get_genai()
+    model_name = model or settings.GEMINI_MODEL
+    loop       = asyncio.get_running_loop()
+    queue: asyncio.Queue[str | None] = asyncio.Queue()
+
+    def _produce() -> None:
+        try:
+            for chunk in client.models.generate_content_stream(model=model_name, contents=prompt):
+                if chunk.text:
+                    loop.call_soon_threadsafe(queue.put_nowait, chunk.text)
+        except Exception as exc:
+            logger.warning(f"Gemini stream error: {exc}")
+            # Yield a fallback so the caller gets something
+            loop.call_soon_threadsafe(queue.put_nowait, generate_gemini_content(prompt, model=model_name))
+        finally:
+            loop.call_soon_threadsafe(queue.put_nowait, None)  # sentinel
+
+    threading.Thread(target=_produce, daemon=True).start()
+    while True:
+        item = await queue.get()
+        if item is None:
+            break
+        yield item
+
+
 def generate_embeddings(text: str) -> list[float]:
     """Generates text embeddings via Gemini embedding model (sync)."""
     try:

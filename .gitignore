@@ -174,3 +174,10 @@ temp/
 *.zip
 site/
 docs/_build/
+
+# ------------------------------------------------------------
+# Custom Script Exclusions
+# ------------------------------------------------------------
+scripts/*
+!scripts/generate_legal_docs.py
+

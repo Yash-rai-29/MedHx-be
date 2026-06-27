@@ -24,6 +24,17 @@ class PushStatus(str, Enum):
 
 # ── Response Models ─────────────────────────────────────────────────────────────
 
+class NotificationExtraData(BaseModel):
+    model_config = {
+        "extra": "allow"
+    }
+    
+    reminder_id:     Optional[str] = Field(None, description="The ID of the associated reminder, if applicable")
+    document_id:     Optional[str] = Field(None, description="The ID of the associated report/document, if applicable")
+    consultation_id: Optional[str] = Field(None, description="The ID of the associated consultation, if applicable")
+    session_id:      Optional[str] = Field(None, description="The ID of the associated chat session, if applicable")
+
+
 class NotificationResponse(BaseModel):
     id:              str                      = Field(..., description="Unique document ID of the notification in Firestore")
     patient_id:      str                      = Field(..., description="The patient Firebase UID associated with this notification")
@@ -33,9 +44,10 @@ class NotificationResponse(BaseModel):
     is_read:         bool                     = Field(..., description="Indicates whether the user has read the notification")
     created_at:      datetime                 = Field(..., description="The UTC timestamp when the notification was generated")
     type:            NotificationType         = Field(..., description="Category of the notification: medicine, consultation, report, vitals, chat, or general")
-    extra_data:      dict                     = Field(default={}, description="Arbitrary payload properties sent alongside the notification")
+    extra_data:      NotificationExtraData    = Field(default_factory=NotificationExtraData, description="Arbitrary payload properties sent alongside the notification")
     push_status:     PushStatus              = Field(..., description="Push notification dispatch status")
     push_message_id: Optional[str]           = Field(None, description="FCM push notification message ID if successfully sent")
+
 
 
 class NotificationListResponse(BaseModel):

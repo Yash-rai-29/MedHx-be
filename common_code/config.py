@@ -39,6 +39,7 @@ class Settings(BaseSettings):
     PATIENTS_COLLECTION: str = "patients"
     DOCTORS_COLLECTION: str = "doctors"
     CONSULTATIONS_COLLECTION: str = "consultations"
+    AUDIO_CONSULTATIONS_COLLECTION: str = "audio_consultations"
     MEDICINES_COLLECTION: str = "medicines"
     REMINDERS_COLLECTION: str = "reminders"
     DOCUMENTS_COLLECTION: str = "documents"

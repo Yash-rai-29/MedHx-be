@@ -4,45 +4,76 @@
       "collectionGroup": "documents",
       "queryScope": "COLLECTION",
       "fields": [
-        {
-          "fieldPath": "patientId",
-          "order": "ASCENDING"
-        },
-        {
-          "fieldPath": "createdAt",
-          "order": "DESCENDING"
-        }
-      ]
-    },
-    {
-      "collectionGroup": "vitals",
-      "queryScope": "COLLECTION",
-      "fields": [
-        {
-          "fieldPath": "patientId",
-          "order": "ASCENDING"
-        },
-        {
-          "fieldPath": "recordedAt",
-          "order": "DESCENDING"
-        }
+        { "fieldPath": "patientId", "order": "ASCENDING" },
+        { "fieldPath": "createdAt", "order": "DESCENDING" }
       ]
     },
     {
       "collectionGroup": "notifications",
       "queryScope": "COLLECTION",
       "fields": [
-        {
-          "fieldPath": "patientId",
-          "order": "ASCENDING"
-        },
-        {
-          "fieldPath": "createdAt",
-          "order": "DESCENDING"
-        }
+        { "fieldPath": "patientId", "order": "ASCENDING" },
+        { "fieldPath": "createdAt", "order": "DESCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "reminders",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "patientId",       "order": "ASCENDING" },
+        { "fieldPath": "next_trigger_at", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "reminders",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "patientId",       "order": "ASCENDING" },
+        { "fieldPath": "status",          "order": "ASCENDING" },
+        { "fieldPath": "next_trigger_at", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "vitals",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "patientId",   "order": "ASCENDING" },
+        { "fieldPath": "recordedAt",  "order": "DESCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "vitals",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "patientId",   "order": "ASCENDING" },
+        { "fieldPath": "measured_at", "order": "DESCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "vitals",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "patientId",   "order": "ASCENDING" },
+        { "fieldPath": "vital_types", "arrayConfig": "CONTAINS" },
+        { "fieldPath": "measured_at", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "chatbot_sessions",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "patient_id",  "order": "ASCENDING" },
+        { "fieldPath": "updated_at",  "order": "DESCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "audio_consultations",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "patientId",  "order": "ASCENDING" },
+        { "fieldPath": "createdAt",  "order": "DESCENDING" }
       ]
     }
   ],
   "fieldOverrides": []
-
 }

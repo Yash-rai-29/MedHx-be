@@ -189,22 +189,26 @@ async def log_patient_vitals(uid: str, height: float, weight: float, db: firesto
     )
 
 async def get_patient_vitals_history(uid: str, db: firestore.AsyncClient) -> list[VitalsLogResponse]:
-    """Retrieves vitals logging history ordered by recorded time."""
-    docs = await db.collection(settings.VITALS_COLLECTION) \
-        .where("patientId", "==", uid) \
-        .order_by("recordedAt", direction=firestore.Query.DESCENDING) \
+    """Retrieves weight/BMI vitals history. Skips entries that lack height/weight (extended vitals docs)."""
+    docs = await (
+        db.collection(settings.VITALS_COLLECTION)
+        .where("patientId", "==", uid)
+        .order_by("recordedAt", direction=firestore.Query.DESCENDING)
         .get()
-        
+    )
     history = []
     for doc in docs:
         d = doc.to_dict()
+        # Extended vitals documents (new module) won't have recordedAt or weight/bmi — skip them
+        if not d.get("height") or not d.get("weight") or not d.get("recordedAt"):
+            continue
         history.append(VitalsLogResponse(
             id=doc.id,
             height=d["height"],
             weight=d["weight"],
-            bmi=d["bmi"],
-            category=d["category"],
-            recorded_at=d["recordedAt"]
+            bmi=d.get("bmi", 0.0),
+            category=d.get("category", ""),
+            recorded_at=d["recordedAt"],
         ))
     return history
 
