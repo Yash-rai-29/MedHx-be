@@ -66,15 +66,15 @@ class ExtractedMedicine(BaseModel):
 
 
 class FollowUpSuggestion(BaseModel):
-    specialty:             str           = Field(..., description="Medical specialty (e.g. cardiology)")
+    specialty:             Optional[str] = Field(None, description="Medical specialty (e.g. cardiology)")
     reason:                Optional[str] = Field(None, description="Why follow-up is needed")
     suggested_within_days: Optional[int] = Field(None, description="Timeframe in days")
 
 
 class SuggestedReminderSchedule(BaseModel):
-    recurrence:   str                   = Field(..., description="once / daily / weekly / monthly")
-    time_of_day:  str                   = Field("09:00", description="HH:MM (24h UTC)")
-    days_of_week: Optional[List[int]]   = Field(None, description="0=Mon..6=Sun for weekly")
+    recurrence:   Optional[str]          = Field(None, description="once / daily / weekly / monthly")
+    time_of_day:  Optional[str]          = Field("09:00", description="HH:MM (24h UTC)")
+    days_of_week: Optional[List[int]]    = Field(None, description="0=Mon..6=Sun for weekly")
 
 
 class ReminderSuggestion(BaseModel):

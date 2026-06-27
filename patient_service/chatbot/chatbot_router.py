@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import uuid
@@ -11,7 +12,7 @@ from typing import List
 from common_code.config import settings
 from common_code.firestore import get_db, log_audit_event
 from common_code.firebase_auth import require_role
-from common_code.gcp_clients import async_upload_bytes_to_gcs, synthesize_speech, transcribe_audio
+from common_code.gcp_clients import synthesize_speech, transcribe_audio_bytes
 from patient_service.chatbot.chatbot_model import (
     ChatRequest,
     ChatResponse,
@@ -127,7 +128,7 @@ async def get_session_history(
         await log_audit_event(actor=uid, action="CHAT_SESSION_VIEW", target=session_id, request=request)
         return details
     except PermissionError as e:
-        raise HTTPException(status_code=403, detail=str(e))
+        raise HTTPException(status_code=404, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
 
@@ -146,7 +147,7 @@ async def delete_session(
         await log_audit_event(actor=uid, action="CHAT_SESSION_DELETE", target=session_id, request=request)
         return DeleteSessionResponse(id=session_id, message="Session deleted successfully.")
     except PermissionError as e:
-        raise HTTPException(status_code=403, detail=str(e))
+        raise HTTPException(status_code=404, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
 
@@ -166,7 +167,7 @@ async def ask_in_session(
         await log_audit_event(actor=uid, action="CHAT_SESSION_ASK", target=session_id, request=request)
         return response
     except PermissionError as e:
-        raise HTTPException(status_code=403, detail=str(e))
+        raise HTTPException(status_code=404, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
@@ -254,26 +255,26 @@ async def chatbot_voice_websocket(
             # ── Audio bytes ────────────────────────────────────
             if message.get("bytes"):
                 audio_bytes = message["bytes"]
-                temp_path   = f"patients/{uid}/temp_voice/{uuid.uuid4()}.wav"
+                if len(audio_bytes) < 100:
+                    # Too short to be real speech — ignore
+                    await websocket.send_json({"event": "silence", "message": "Audio too short."})
+                    continue
 
+                filename = f"{uuid.uuid4()}.wav"
                 try:
-                    gcs_uri           = await async_upload_bytes_to_gcs(temp_path, audio_bytes, "audio/wav")
-                    transcription     = await transcribe_audio(gcs_uri)
-                    prompt_text       = transcription.get("full_text", "").strip()
+                    transcription = await transcribe_audio_bytes(audio_bytes, filename=filename)
+                    prompt_text   = transcription.get("full_text", "").strip()
                 except Exception as ex:
                     logger.error(f"WS transcription error: {ex}")
                     await websocket.send_json({"event": "error", "message": "Audio transcription failed."})
                     continue
-                finally:
-                    try:
-                        from common_code.gcp_clients import _get_storage
-                        _get_storage().bucket(settings.STORAGE_BUCKET_NAME).blob(temp_path).delete()
-                    except Exception:
-                        pass
 
                 if not prompt_text:
                     await websocket.send_json({"event": "silence", "message": "No speech detected."})
                     continue
+
+                # Send transcription immediately so the FE can show it without waiting
+                await websocket.send_json({"event": "transcribed", "user_text": prompt_text})
 
             # ── Text frame ────────────────────────────────────
             elif message.get("text"):
@@ -289,18 +290,17 @@ async def chatbot_voice_websocket(
 
             # ── RAG + Gemini ───────────────────────────────────
             try:
-                chat_resp   = await ask_inside_session(session_id, uid, prompt_text, db)
-                reply_text  = chat_resp.reply
-                sources     = chat_resp.sources
+                chat_resp  = await ask_inside_session(session_id, uid, prompt_text, db)
+                reply_text = chat_resp.reply
+                sources    = [s.model_dump() for s in chat_resp.sources]
             except Exception as ex:
-                logger.error(f"WS RAG error: {ex}")
+                logger.error(f"WS RAG error: {ex}", exc_info=True)
                 await websocket.send_json({"event": "error", "message": "Failed to generate a response."})
                 continue
 
-            # ── TTS ────────────────────────────────────────────
+            # ── TTS (async, non-blocking) ────────────────────────
             try:
-                import asyncio
-                voice_bytes = await asyncio.to_thread(synthesize_speech, reply_text)
+                voice_bytes = await asyncio.to_thread(synthesize_speech, reply_text, "en-IN")
             except Exception as ex:
                 logger.warning(f"WS TTS error: {ex}")
                 voice_bytes = b""

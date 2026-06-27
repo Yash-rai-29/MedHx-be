@@ -20,7 +20,8 @@ class Settings(BaseSettings):
     # gemini-2.5-flash is the recommended fast model available in us-central1.
     # NOTE: Flash models are NOT available in asia-south1 via Vertex AI.
     GEMINI_MODEL: str = "gemini-2.5-flash"
-    GEMINI_EMBEDDING_MODEL: str = "text-embedding-004"
+    GEMINI_EMBEDDING_MODEL: str = "gemini-embedding-001"
+    EMBEDDING_OUTPUT_DIM: int = 1536   # balanced: 2× quality headroom over 768, half the cost of 3072
     # Gemini/Vertex region — must be us-central1 for flash models
     GEMINI_LOCATION: str = "us-central1"
 
@@ -53,6 +54,7 @@ class Settings(BaseSettings):
     CHAT_SESSIONS_COLLECTION: str = "chatbot_sessions"
     LEGAL_COLLECTION: str = "legal_documents"
     NOTIFICATIONS_COLLECTION: str = "notifications"
+    DOCUMENT_CHUNKS_COLLECTION: str = "document_chunks"
 
 
     # ── Runtime ───────────────────────────────────────────────

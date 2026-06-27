@@ -24,6 +24,11 @@
     "default_body": "Hi {patient_first_name}, I have processed your request. Click here to chat.",
     "deeplink_template": "/chatbot/{session_id}"
   },
+  "audio_consultation": {
+    "default_title": "Consultation analysis ready 🩺",
+    "default_body": "Hi {patient_first_name}, your recording has been analysed. Tap to view the summary.",
+    "deeplink_template": "/consultations/audio/{consultation_id}"
+  },
   "general": {
     "default_title": "Update from Health Companion 🔔",
     "default_body": "Hello {patient_first_name}, you have a new update.",

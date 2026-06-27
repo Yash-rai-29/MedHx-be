@@ -1,3 +1,4 @@
+import asyncio
 import datetime
 import uuid
 import json
@@ -28,6 +29,82 @@ from patient_service.documents.documents_model import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# ══════════════════════════════════════════════════════════════
+#  RAG chunk helpers
+# ══════════════════════════════════════════════════════════════
+
+def _chunk_text(text: str, size: int = 600, overlap: int = 100) -> list[str]:
+    """Split text into overlapping fixed-size character chunks."""
+    text = (text or "").strip()
+    if not text:
+        return []
+    if len(text) <= size:
+        return [text]
+    chunks: list[str] = []
+    start = 0
+    while start < len(text):
+        chunk = text[start:start + size].strip()
+        if chunk:
+            chunks.append(chunk)
+        if start + size >= len(text):
+            break
+        start += size - overlap
+    return chunks
+
+
+async def _store_document_chunks(
+    doc_id: str,
+    uid: str,
+    doc_title: str,
+    doc_type: str,
+    summary: str,
+    raw_text: str,
+    db: firestore.AsyncClient,
+) -> None:
+    """Splits a document into overlapping passages, embeds each, and stores them in
+    the document_chunks collection for Firestore Vector Search retrieval."""
+    try:
+        from google.cloud.firestore_v1.vector import Vector
+    except ImportError:
+        logger.warning("[chunk] google-cloud-firestore Vector not available — skipping chunk storage")
+        return
+
+    combined = f"Summary: {summary}\n\n{raw_text}".strip() if summary else raw_text
+    chunks = _chunk_text(combined)
+    if not chunks:
+        return
+
+    # Delete any stale chunks from a previous processing run
+    stale = await db.collection(settings.DOCUMENT_CHUNKS_COLLECTION).where("doc_id", "==", doc_id).get()
+    if stale:
+        del_batch = db.batch()
+        for s in stale:
+            del_batch.delete(s.reference)
+        await del_batch.commit()
+
+    # Embed all chunks in parallel to minimize latency
+    embeddings = await asyncio.gather(*[async_generate_embeddings(c, task_type="RETRIEVAL_DOCUMENT") for c in chunks])
+
+    # Write in batches (Firestore limit = 500 ops per batch)
+    BATCH_SIZE = 450
+    for batch_start in range(0, len(chunks), BATCH_SIZE):
+        write_batch = db.batch()
+        for i in range(batch_start, min(batch_start + BATCH_SIZE, len(chunks))):
+            ref = db.collection(settings.DOCUMENT_CHUNKS_COLLECTION).document()
+            write_batch.set(ref, {
+                "doc_id":      doc_id,
+                "patientId":   uid,
+                "doc_title":   doc_title,
+                "doc_type":    doc_type,
+                "chunk_index": i,
+                "text":        chunks[i],
+                "embedding":   Vector(embeddings[i]),
+            })
+        await write_batch.commit()
+
+    logger.info(f"[doc:{doc_id}] Stored {len(chunks)} chunks in document_chunks")
 
 
 def _coerce_medications(raw: list) -> list[dict]:
@@ -315,9 +392,22 @@ async def background_parse_and_index_document(
             summary  = gemini_output
             doc_type = _infer_doc_type_from_text(raw_text)
 
-        # 3. Generate embedding vector (non-blocking thread offload)
+        # 3. Generate document-level embedding (for backward-compat fallback) and
+        #    chunk-level embeddings (for Firestore Vector Search).
         embedding_text = f"Summary: {summary}\nReport details: {raw_text[:500]}"
-        vector = await async_generate_embeddings(embedding_text)
+        final_title_for_chunks = title or generated_title or (doc_id)
+        vector, _ = await asyncio.gather(
+            async_generate_embeddings(embedding_text, task_type="RETRIEVAL_DOCUMENT"),
+            _store_document_chunks(
+                doc_id=doc_id,
+                uid=uid,
+                doc_title=final_title_for_chunks,
+                doc_type=doc_type.value,
+                summary=summary,
+                raw_text=raw_text,
+                db=db,
+            ),
+        )
         logger.info(f"[doc:{doc_id}] Embedding generated, dim={len(vector)}")
 
         # 4. Persist enriched data to Firestore
@@ -388,6 +478,18 @@ async def delete_document(uid: str, doc_id: str, db: firestore.AsyncClient) -> N
             logger.info(f"[doc:{doc_id}] GCS blob deleted: {file_ref}")
         except Exception as e:
             logger.warning(f"[doc:{doc_id}] GCS blob deletion failed (continuing): {e}")
+
+    # Delete all RAG chunks for this document (best-effort)
+    try:
+        chunks_snap = await db.collection(settings.DOCUMENT_CHUNKS_COLLECTION).where("doc_id", "==", doc_id).get()
+        if chunks_snap:
+            chunk_batch = db.batch()
+            for c in chunks_snap:
+                chunk_batch.delete(c.reference)
+            await chunk_batch.commit()
+            logger.info(f"[doc:{doc_id}] Deleted {len(chunks_snap)} document chunks")
+    except Exception as e:
+        logger.warning(f"[doc:{doc_id}] Chunk deletion failed (continuing): {e}")
 
     await doc_ref.delete()
     logger.info(f"[doc:{doc_id}] Firestore record deleted by uid={uid}")

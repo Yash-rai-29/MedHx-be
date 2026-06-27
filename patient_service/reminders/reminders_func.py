@@ -5,7 +5,9 @@ from typing import Optional
 
 from google.cloud import firestore
 
-from common_code.cloud_tasks import create_cloud_task
+import asyncio
+
+from common_code.cloud_tasks import cancel_reminder_task, create_cloud_task
 from common_code.config import settings
 from common_code.notification_dispatcher import dispatch_notification
 from patient_service.reminders.reminders_model import (
@@ -22,6 +24,8 @@ from patient_service.reminders.reminders_model import (
     FollowUpReminderDetails,
 )
 
+from zoneinfo import ZoneInfo
+
 logger = logging.getLogger(__name__)
 
 MAX_TASK_DAYS    = 30
@@ -33,12 +37,22 @@ RELAY_BUFFER_DAYS = 27
 # ══════════════════════════════════════════════════════════════
 
 def compute_next_trigger(schedule: ReminderSchedule, after: datetime) -> Optional[datetime]:
-    """Returns the next UTC datetime this schedule should fire after `after`, or None if exhausted."""
+    """Returns the next UTC datetime this schedule should fire after `after`, or None if exhausted.
+    
+    All time_of_day values are interpreted in the Asia/Kolkata (IST) timezone.
+    """
+    kolkata_tz = ZoneInfo("Asia/Kolkata")
     hour, minute = map(int, schedule.time_of_day.split(":"))
     end = schedule.end_date
 
+    # Convert the after UTC datetime to Asia/Kolkata to perform correct date checks
+    after_local = after.astimezone(kolkata_tz)
+    local_date = after_local.date()
+
     def at_time(d: date) -> datetime:
-        return datetime(d.year, d.month, d.day, hour, minute, tzinfo=UTC)
+        # Create localized datetime in Asia/Kolkata, then convert to UTC
+        local_dt = datetime(d.year, d.month, d.day, hour, minute, tzinfo=kolkata_tz)
+        return local_dt.astimezone(UTC)
 
     def past_end(d: date) -> bool:
         return end is not None and d > end
@@ -48,7 +62,7 @@ def compute_next_trigger(schedule: ReminderSchedule, after: datetime) -> Optiona
         return target if target > after else None
 
     if schedule.recurrence == RecurrenceType.daily:
-        candidate = max(schedule.start_date, after.date())
+        candidate = max(schedule.start_date, local_date)
         for _ in range(366 * 10):
             if past_end(candidate):
                 return None
@@ -61,7 +75,7 @@ def compute_next_trigger(schedule: ReminderSchedule, after: datetime) -> Optiona
     if schedule.recurrence == RecurrenceType.weekly:
         if not schedule.days_of_week:
             return None
-        candidate = max(schedule.start_date, after.date())
+        candidate = max(schedule.start_date, local_date)
         for _ in range(366 * 10):
             if past_end(candidate):
                 return None
@@ -74,7 +88,7 @@ def compute_next_trigger(schedule: ReminderSchedule, after: datetime) -> Optiona
 
     if schedule.recurrence == RecurrenceType.monthly:
         dom = min(schedule.day_of_month or schedule.start_date.day, 28)
-        year, month = after.year, after.month
+        year, month = after_local.year, after_local.month
         for _ in range(12 * 50):
             try:
                 target_date = date(year, month, dom)
@@ -88,7 +102,7 @@ def compute_next_trigger(schedule: ReminderSchedule, after: datetime) -> Optiona
             if month > 12:
                 month = 1
                 year += 1
-            if year > after.year + 50:
+            if year > after_local.year + 50:
                 return None
         return None
 
@@ -334,11 +348,18 @@ async def delete_reminder(
     snap    = await doc_ref.get()
     if not snap.exists:
         raise ValueError("Reminder not found.")
-    if snap.to_dict().get("patientId") != uid:
+    d = snap.to_dict()
+    if d.get("patientId") != uid:
         raise PermissionError("Access is unauthorized.")
-    # Set cancelled — the next Cloud Task will see this and stop the chain.
-    # No need to cancel tasks via Cloud Tasks API.
+
+    # Mark cancelled in Firestore — this is the authoritative stop signal
     await doc_ref.update({"status": ReminderStatus.cancelled.value})
+
+    # Best-effort: also delete the pending Cloud Task immediately so it
+    # never fires even if the handler hasn't restarted yet.
+    next_trigger = d.get("next_trigger_at")
+    if next_trigger:
+        await asyncio.to_thread(cancel_reminder_task, reminder_id, next_trigger)
 
 
 # ══════════════════════════════════════════════════════════════

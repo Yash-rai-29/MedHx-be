@@ -59,6 +59,44 @@ def create_cloud_task(
         return f"error/{task_name}"
 
 
+def cancel_reminder_task(
+    reminder_id: str,
+    target_at: datetime.datetime,
+    queue: str | None = None,
+) -> None:
+    """
+    Proactively deletes the pending Cloud Task(s) for a reminder after it is cancelled.
+    Tries both naming patterns (notify and relay) since we don't know which is currently live.
+    Errors are swallowed — Firestore status=cancelled is the authoritative stop signal.
+    """
+    if settings.ENVIRONMENT == "development":
+        logger.info(f"[DEV] Mock cancel Cloud Tasks for reminder {reminder_id}")
+        return
+
+    try:
+        client   = tasks_v2.CloudTasksClient()
+        project  = settings.GCP_PROJECT_ID
+        location = settings.GCP_REGION or "asia-south1"
+        q_name   = queue or settings.CLOUD_TASKS_QUEUE_NAME or "notification-queue"
+        parent   = client.queue_path(project, location, q_name)
+
+        ts = int(target_at.timestamp())
+        candidates = [
+            f"{parent}/tasks/reminder-{reminder_id}-{ts}",
+            f"{parent}/tasks/relay-{reminder_id}-{ts}",
+        ]
+        for task_name in candidates:
+            try:
+                client.delete_task(name=task_name)
+                logger.info(f"Cancelled Cloud Task: {task_name}")
+            except Exception:
+                # Task already ran, was never created, or was deduplicated — not an error
+                logger.debug(f"Task not found (already ran or deduped): {task_name}")
+
+    except Exception as e:
+        logger.warning(f"Cloud Task cancellation failed for reminder {reminder_id}: {e}")
+
+
 def schedule_notification_task(
     reminder_id: str,
     patient_id: str,

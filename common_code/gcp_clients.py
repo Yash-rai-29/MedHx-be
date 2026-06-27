@@ -152,93 +152,92 @@ async def async_upload_bytes_to_gcs(blob_name: str, data: bytes, content_type: s
 # ══════════════════════════════════════════════════════════════
 #  2. Speech-to-Text v2 (Chirp)
 # ══════════════════════════════════════════════════════════════
-async def transcribe_audio(gcs_uri: str, language_code: str = "en-IN") -> dict[str, Any]:
-    """Diarised transcription via STT v2 Chirp model or ElevenLabs Speech-to-Text Scribe v2."""
+async def transcribe_audio_bytes(
+    audio_bytes: bytes,
+    filename: str = "audio.wav",
+    language_code: str = "en-IN",
+) -> dict[str, Any]:
+    """
+    Transcribe raw audio bytes — no GCS round-trip needed.
+    Primary: ElevenLabs Scribe v2 (fastest).
+    Fallback: GCP STT v2 Chirp (via inline_data).
+    Returns {"full_text": str, "segments": list}.
+    """
+    # ── Primary: ElevenLabs ──────────────────────────────────────
     if settings.ELEVENLABS_API_KEY:
         try:
-            logger.info("Attempting ElevenLabs Speech-to-Text transcription...")
-            # Download audio file from GCS into memory bytes
-            bucket_name, blob_name = gcs_uri.replace("gs://", "").split("/", 1)
-            audio_bytes = _get_storage().bucket(bucket_name).blob(blob_name).download_as_bytes()
-            
-            url = "https://api.elevenlabs.io/v1/speech-to-text"
-            headers = {
-                "xi-api-key": settings.ELEVENLABS_API_KEY
-            }
-            filename = blob_name.split("/")[-1] or "audio.wav"
             mime_type = "audio/wav"
             if filename.endswith(".mp3"):
                 mime_type = "audio/mpeg"
             elif filename.endswith(".m4a"):
                 mime_type = "audio/mp4"
-                
-            files = {
-                "file": (filename, audio_bytes, mime_type)
-            }
-            data = {
-                "model_id": settings.ELEVENLABS_STT_MODEL_ID
-            }
-            
+            elif filename.endswith(".ogg"):
+                mime_type = "audio/ogg"
+            elif filename.endswith(".webm"):
+                mime_type = "audio/webm"
+
             async with httpx.AsyncClient() as client:
-                response = await client.post(url, headers=headers, files=files, data=data, timeout=120.0)
-                
+                response = await client.post(
+                    "https://api.elevenlabs.io/v1/speech-to-text",
+                    headers={"xi-api-key": settings.ELEVENLABS_API_KEY},
+                    files={"file": (filename, audio_bytes, mime_type)},
+                    data={"model_id": settings.ELEVENLABS_STT_MODEL_ID},
+                    timeout=60.0,
+                )
+
             if response.status_code == 200:
                 result = response.json()
-                text = result.get("text", "")
+                text = result.get("text", "").strip()
                 return {
                     "full_text": text,
-                    "segments": [{"speaker": "Speaker 1", "text": text}]
+                    "segments": [{"speaker": "Patient", "text": text}],
                 }
             else:
-                logger.warning(f"ElevenLabs STT failed with status {response.status_code}: {response.text}, falling back to GCP/Mock")
+                logger.warning(
+                    f"ElevenLabs STT failed {response.status_code}: {response.text[:200]}, "
+                    "falling back to GCP STT"
+                )
         except Exception as e:
-            logger.warning(f"ElevenLabs STT request failed: {e}, falling back to GCP/Mock")
+            logger.warning(f"ElevenLabs STT error: {e}, falling back to GCP STT")
 
+    # ── Fallback: GCP STT v2 inline bytes ───────────────────────
     try:
         client = speech_v2.SpeechClient()
         recognizer = f"projects/{settings.GCP_PROJECT_ID}/locations/global/recognizers/_"
-
         config = speech_v2.types.RecognitionConfig(
             auto_decoding_config=speech_v2.types.AutoDetectDecodingConfig(),
             language_codes=[language_code],
             model="chirp",
-            features=speech_v2.types.RecognitionFeatures(
-                enable_word_time_offsets=True,
-            ),
         )
-
         request = speech_v2.types.RecognizeRequest(
             recognizer=recognizer,
             config=config,
-            uri=gcs_uri,
+            content=audio_bytes,
         )
-
-
-        response = client.recognize(request=request)
-
+        resp = await asyncio.to_thread(client.recognize, request)
         segments = []
-        for result in response.results:
+        for result in resp.results:
             alt = result.alternatives[0]
-            speaker = getattr(alt.words[0], "speaker_tag", 1) if alt.words else 1
-            segments.append({"speaker": f"Speaker {speaker}", "text": alt.transcript})
-
-        full_transcript = " ".join(s["text"] for s in segments)
-        return {"full_text": full_transcript, "segments": segments}
+            segments.append({"speaker": "Patient", "text": alt.transcript})
+        full_text = " ".join(s["text"] for s in segments)
+        return {"full_text": full_text, "segments": segments}
     except Exception as e:
-        logger.warning(f"STT failed, using mock: {e}")
-        return {
-            "full_text": (
-                "Doctor: Hello, what brings you in today? "
-                "Patient: I have had a severe sore throat and fever for the past three days. "
-                "Doctor: I will prescribe paracetamol for the fever and amoxicillin for the throat infection. "
-                "Take paracetamol twice a day after meals, and amoxicillin three times a day."
-            ),
-            "segments": [
-                {"speaker": "Doctor", "text": "Hello, what brings you in today?"},
-                {"speaker": "Patient", "text": "I have had a severe sore throat and fever for the past three days."},
-                {"speaker": "Doctor", "text": "I will prescribe paracetamol for the fever and amoxicillin for the throat infection. Take paracetamol twice a day after meals, and amoxicillin three times a day."},
-            ],
-        }
+        logger.warning(f"GCP STT fallback failed: {e}")
+        return {"full_text": "", "segments": []}
+
+
+async def transcribe_audio(gcs_uri: str, language_code: str = "en-IN") -> dict[str, Any]:
+    """Transcribe audio from a GCS URI (used for consultation uploads, not voice chat)."""
+    try:
+        bucket_name, blob_name = gcs_uri.replace("gs://", "").split("/", 1)
+        audio_bytes = await asyncio.to_thread(
+            _get_storage().bucket(bucket_name).blob(blob_name).download_as_bytes
+        )
+        filename = blob_name.split("/")[-1] or "audio.wav"
+        return await transcribe_audio_bytes(audio_bytes, filename=filename, language_code=language_code)
+    except Exception as e:
+        logger.warning(f"GCS download for transcription failed: {e}")
+        return {"full_text": "", "segments": []}
 
 
 # ══════════════════════════════════════════════════════════════
@@ -413,23 +412,31 @@ async def stream_gemini_content(prompt: str, model: str | None = None):
         yield item
 
 
-def generate_embeddings(text: str) -> list[float]:
-    """Generates text embeddings via Gemini embedding model (sync)."""
+def generate_embeddings(text: str, task_type: str = "RETRIEVAL_DOCUMENT") -> list[float]:
+    """Generates text embeddings via Gemini embedding model (sync).
+
+    task_type should be "RETRIEVAL_DOCUMENT" when embedding content to store,
+    and "RETRIEVAL_QUERY" when embedding a search query.
+    """
     try:
         client = _get_genai()
         result = client.models.embed_content(
             model=settings.GEMINI_EMBEDDING_MODEL,
             contents=text,
+            config=genai_types.EmbedContentConfig(
+                task_type=task_type,
+                output_dimensionality=settings.EMBEDDING_OUTPUT_DIM,
+            ),
         )
         return result.embeddings[0].values
     except Exception as e:
         logger.warning(f"Embedding failed: {e}")
-        return [0.0] * 768
+        return [0.0] * settings.EMBEDDING_OUTPUT_DIM
 
 
-async def async_generate_embeddings(text: str) -> list[float]:
+async def async_generate_embeddings(text: str, task_type: str = "RETRIEVAL_DOCUMENT") -> list[float]:
     """Non-blocking embedding call — wraps the sync call in a thread pool."""
-    return await asyncio.to_thread(generate_embeddings, text)
+    return await asyncio.to_thread(generate_embeddings, text, task_type)
 
 
 # ══════════════════════════════════════════════════════════════

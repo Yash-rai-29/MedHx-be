@@ -7,6 +7,7 @@ from typing import Optional
 from google.cloud import firestore
 
 from common_code.config import settings
+from common_code.notification_dispatcher import dispatch_notification
 from common_code.gcp_clients import (
     async_generate_gemini_content,
     async_upload_bytes_to_gcs,
@@ -289,6 +290,13 @@ async def background_process_audio_consultation(
             "error_message":        None,
         })
         logger.info(f"Audio consultation {consultation_id} processed successfully.")
+        await dispatch_notification(
+            patient_id=uid,
+            title=None,
+            body=None,
+            notification_type="audio_consultation",
+            extra_data={"consultation_id": consultation_id},
+        )
 
     except Exception as e:
         logger.error(f"Audio consultation {consultation_id} failed: {e}")
@@ -296,6 +304,13 @@ async def background_process_audio_consultation(
             "status":        AudioConsultationStatus.failed.value,
             "error_message": f"Processing error: {str(e)[:400]}",
         })
+        await dispatch_notification(
+            patient_id=uid,
+            title="Consultation processing failed",
+            body="We could not analyse your recording. Please try uploading again.",
+            notification_type="audio_consultation",
+            extra_data={"consultation_id": consultation_id},
+        )
 
 
 # ══════════════════════════════════════════════════════════════
@@ -308,16 +323,20 @@ def _parse_suggestions(raw: list) -> list[ReminderSuggestion]:
         if not isinstance(s, dict) or not s.get("title"):
             continue
         try:
-            med_raw  = s.get("medicine_details")
-            fup_raw  = s.get("follow_up_details")
-            sched_raw = s.get("suggested_schedule")
+            med_raw   = s.get("medicine_details") or {}
+            fup_raw   = s.get("follow_up_details") or {}
+            sched_raw = s.get("suggested_schedule") or {}
+            # Only construct sub-models when at least one meaningful field is non-null
+            med_details  = ExtractedMedicine(**med_raw)           if med_raw.get("name")      else None
+            fup_details  = FollowUpSuggestion(**fup_raw)          if fup_raw.get("specialty")  else None
+            sched_detail = SuggestedReminderSchedule(**sched_raw) if sched_raw.get("recurrence") else None
             out.append(ReminderSuggestion(
                 title=s["title"],
                 type=s.get("type", "medicine"),
                 notes=s.get("notes"),
-                medicine_details=ExtractedMedicine(**med_raw)          if med_raw   else None,
-                follow_up_details=FollowUpSuggestion(**fup_raw)        if fup_raw   else None,
-                suggested_schedule=SuggestedReminderSchedule(**sched_raw) if sched_raw else None,
+                medicine_details=med_details,
+                follow_up_details=fup_details,
+                suggested_schedule=sched_detail,
             ))
         except Exception as e:
             logger.warning(f"Skipping malformed suggestion: {e}")
@@ -362,7 +381,6 @@ async def get_audio_consultations(uid: str, db: firestore.AsyncClient) -> list[A
     docs = await (
         db.collection(_COLL)
         .where("patientId", "==", uid)
-        .order_by("created_at", direction=firestore.Query.DESCENDING)
         .get()
     )
     results = []
@@ -371,6 +389,7 @@ async def get_audio_consultations(uid: str, db: firestore.AsyncClient) -> list[A
             results.append(_to_response(doc.id, doc.to_dict()))
         except Exception as e:
             logger.warning(f"Skipping malformed audio consultation {doc.id}: {e}")
+    results.sort(key=lambda r: r.created_at or datetime.min.replace(tzinfo=UTC), reverse=True)
     return results
 
 

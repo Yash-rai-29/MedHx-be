@@ -5,8 +5,8 @@ from common_code.config import settings
 
 @pytest.fixture
 def mock_ai():
-    with patch("patient_service.chatbot.chatbot_func.generate_embeddings") as mock_embed, \
-         patch("patient_service.chatbot.chatbot_func.generate_gemini_content") as mock_gemini:
+    with patch("patient_service.chatbot.chatbot_func.async_generate_embeddings") as mock_embed, \
+         patch("patient_service.chatbot.chatbot_func.async_generate_gemini_content") as mock_gemini:
         # Prompt search embedding matching target document
         mock_embed.return_value = [1.0] + [0.0] * 767
         mock_gemini.return_value = "Your blood test indicates healthy blood cells, but keep drinking water."
@@ -26,6 +26,7 @@ def test_chatbot_rag_tenant_isolation(client, mock_db, mock_user, mock_ai):
             "fileRef": "patient_a_report.pdf",
             "summary": "Patient A has mild fever.",
             "raw_text": "Symptoms: fever for 2 days. Diagnostic result: normal.",
+            "status": "completed",
             "embedding": [1.0] + [0.0] * 767 # matches prompt vector exactly
         },
         # Document owned by Patient B
@@ -34,6 +35,7 @@ def test_chatbot_rag_tenant_isolation(client, mock_db, mock_user, mock_ai):
             "fileRef": "secret_patient_b_report.pdf",
             "summary": "Patient B has acute bronchitis.",
             "raw_text": "Secret details: Patient B diagnosed with tuberculosis CA01.",
+            "status": "completed",
             "embedding": [1.0] + [0.0] * 767 # matches prompt vector exactly
         }
     }
@@ -43,8 +45,8 @@ def test_chatbot_rag_tenant_isolation(client, mock_db, mock_user, mock_ai):
     assert response.status_code == 200
     data = response.json()
     assert data["reply"] is not None
-    assert "patient_a_report.pdf" in data["sources"]
-    assert "secret_patient_b_report.pdf" not in data["sources"] # absolute tenant isolation enforced
+    assert any(s["title"] == "patient_a_report.pdf" for s in data["sources"])
+    assert not any(s["title"] == "secret_patient_b_report.pdf" for s in data["sources"]) # absolute tenant isolation enforced
 
     # Inspect RAG prompt construction sent to Gemini
     args, kwargs = mock_ai["gemini"].call_args
@@ -185,15 +187,19 @@ def test_chatbot_voice_websocket(client, mock_db, mock_user, mock_ai):
         }
     }
     
-    with patch("patient_service.chatbot.chatbot_router.upload_bytes_to_gcs", return_value="gs://mock-bucket/patients/test-patient-123/temp_voice_abc.wav") as mock_upload, \
-         patch("patient_service.chatbot.chatbot_router.transcribe_audio", return_value={"full_text": "Am I healthy?"}) as mock_transcribe, \
+    with patch("patient_service.chatbot.chatbot_router.transcribe_audio_bytes", return_value={"full_text": "Am I healthy?"}) as mock_transcribe, \
          patch("patient_service.chatbot.chatbot_router.synthesize_speech", return_value=b"SYNTHESIZED_MP3_SPEECH") as mock_synth:
          
         with client.websocket_connect("/chatbot/sessions/session-ws/ws/voice?token=mock-valid-token") as websocket:
-            # 1. Test sending binary audio data
-            websocket.send_bytes(b"INPUT_AUDIO_RAW_BYTES")
+            # 1. Test sending binary audio data (must be >100 bytes to pass length guard)
+            websocket.send_bytes(b"INPUT_AUDIO_RAW_BYTES" * 10)  # 210 bytes
             
-            # Receive metadata response (JSON)
+            # Receive immediate transcription confirmation
+            transcribed_event = websocket.receive_json()
+            assert transcribed_event["event"] == "transcribed"
+            assert transcribed_event["user_text"] == "Am I healthy?"
+
+            # Receive full metadata response (JSON)
             response_metadata = websocket.receive_json()
             assert response_metadata["event"] == "response"
             assert response_metadata["user_text"] == "Am I healthy?"

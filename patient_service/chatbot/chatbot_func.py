@@ -1,8 +1,11 @@
 import datetime
 import json
+import logging
 import uuid
 from typing import AsyncGenerator, Optional
 from google.cloud import firestore
+
+logger = logging.getLogger(__name__)
 
 from common_code.config import settings
 from common_code.gcp_clients import async_generate_embeddings, async_generate_gemini_content, stream_gemini_content
@@ -14,20 +17,33 @@ from patient_service.chatbot.chatbot_model import (
     ChatSessionResponse,
     MessageRole,
 )
+from patient_service.chatbot.chatbot_tools import execute_tool, try_tool_call
 
-_RAG_TOP_K         = 3
-_RAG_SIM_THRESHOLD = 0.35   # below this the doc is not relevant enough to include
-_HISTORY_WINDOW    = 10      # last N messages sent to Gemini as conversation context
+_RAG_TOP_K         = 5      # retrieve more candidates before threshold filtering
+_RAG_SIM_THRESHOLD = 0.20   # lowered: 0.35 was too strict for varied phrasing
+_HISTORY_WINDOW    = 10
 
 _SYSTEM_PROMPT = (
-    "You are an empathetic, professional AI Health Companion. "
-    "Answer the patient's health or medical history questions using the context below. "
-    "Follow these rules strictly:\n"
+    "You are an empathetic, professional AI Health Companion.\n"
+    "You can help with: answering health questions from the patient's uploaded reports, "
+    "listing their documents, and managing reminders (create, pause, delete).\n\n"
+    "Follow these rules:\n"
     "1. GROUNDING: Base answers on the provided report context when available. "
     "If no relevant context exists, say so honestly.\n"
     "2. NON-DIAGNOSTIC: Never make a definitive diagnosis. Use phrasing like 'may indicate', 'suggests'.\n"
-    "3. SAFETY: Always remind the patient to consult their doctor for any medical decisions.\n"
+    "3. SAFETY: Remind the patient to consult their doctor for any medical decisions.\n"
     "4. CLARITY: Use plain language — avoid unexplained medical jargon.\n"
+    "5. CAPABILITY: If the patient asks to create or manage a reminder and it was not already "
+    "handled by a tool, acknowledge that reminder management is supported and ask them to "
+    "rephrase (e.g. 'Set a daily reminder at 9 AM').\n"
+    "6. REMINDER DETAILS GATHERING: Before calling the `create_reminder` tool, you must make sure "
+    "you have identified the following details. If any of these are missing from the user's initial request, "
+    "do NOT guess or use default placeholders; instead, ask the user to clarify:\n"
+    "   - What is the title or medicine name of the reminder?\n"
+    "   - Is it a medication reminder (medicine) or a doctor visit/follow-up reminder (follow_up)?\n"
+    "   - What is the exact time of day (e.g., 9:00 AM, 10:00 PM)?\n"
+    "   - For medicine reminders: What is the dosage (e.g., '1 tablet', '500mg') and instructions (e.g., 'after meals')?\n"
+    "   - Does the reminder repeat (recurrence like daily/weekly), and if so, is there an end date?\n"
 )
 
 
@@ -49,9 +65,63 @@ def _cosine_similarity(v1: list[float], v2: list[float]) -> float:
 async def _rag_context(uid: str, prompt: str, db: firestore.AsyncClient) -> tuple[str, list[ChatCitation]]:
     """
     Tenant-isolated RAG retrieval.
-    Returns (context_str, citations) where each citation carries id, title, and document type.
-    Only fetches completed documents that have embeddings and exceed the similarity threshold.
+
+    Primary path: Firestore Vector Search on document_chunks — finds the most
+    relevant passage per document without loading all embeddings into memory.
+
+    Fallback: in-memory cosine similarity against the document-level embedding
+    (covers documents processed before chunking was introduced).
     """
+    prompt_vector = await async_generate_embeddings(prompt, task_type="RETRIEVAL_QUERY")
+
+    # ── Primary: Firestore Vector Search on chunk-level embeddings ─────────────
+    try:
+        from google.cloud.firestore_v1.vector import Vector
+        from google.cloud.firestore_v1.base_vector_query import DistanceMeasure
+
+        chunk_snap = await (
+            db.collection(settings.DOCUMENT_CHUNKS_COLLECTION)
+            .where("patientId", "==", uid)
+            .find_nearest(
+                vector_field="embedding",
+                query_vector=Vector(prompt_vector),
+                distance_measure=DistanceMeasure.COSINE,
+                limit=_RAG_TOP_K * 3,   # over-fetch; dedup by doc_id trims to TOP_K
+            )
+            .get()
+        )
+
+        if chunk_snap:
+            # Results are ordered nearest-first. Keep the first (best) chunk per doc.
+            seen: set[str] = set()
+            context_parts: list[str]         = []
+            citations:     list[ChatCitation] = []
+
+            for chunk_doc in chunk_snap:
+                c      = chunk_doc.to_dict()
+                doc_id = c.get("doc_id", "")
+                if not doc_id or doc_id in seen:
+                    continue
+                seen.add(doc_id)
+                context_parts.append(
+                    f"Document: {c.get('doc_title', 'Untitled')}\n"
+                    f"Excerpt: {c['text']}\n"
+                )
+                citations.append(ChatCitation(
+                    id=doc_id,
+                    title=c.get("doc_title", ""),
+                    type=c.get("doc_type"),
+                ))
+                if len(context_parts) >= _RAG_TOP_K:
+                    break
+
+            if context_parts:
+                return "\n---\n".join(context_parts), citations
+
+    except Exception as e:
+        logger.warning(f"Vector search unavailable, using in-memory fallback: {e}")
+
+    # ── Fallback: load completed docs and run cosine similarity in Python ───────
     docs_snap = await (
         db.collection(settings.DOCUMENTS_COLLECTION)
         .where("patientId", "==", uid)
@@ -74,9 +144,15 @@ async def _rag_context(uid: str, prompt: str, db: firestore.AsyncClient) -> tupl
     ]
 
     if not embedded_docs:
-        return "No medical records found for this patient.", []
-
-    prompt_vector = await async_generate_embeddings(prompt)
+        all_snap = await db.collection(settings.DOCUMENTS_COLLECTION).where("patientId", "==", uid).get()
+        total = len(all_snap)
+        if total == 0:
+            return "The patient has not uploaded any medical documents yet.", []
+        return (
+            f"The patient has {total} document(s) but none have finished processing yet. "
+            "Cannot retrieve document content.",
+            [],
+        )
 
     ranked = sorted(
         ((_cosine_similarity(prompt_vector, doc["embedding"]), doc) for doc in embedded_docs),
@@ -84,8 +160,8 @@ async def _rag_context(uid: str, prompt: str, db: firestore.AsyncClient) -> tupl
         reverse=True,
     )
 
-    context_parts: list[str]         = []
-    citations:     list[ChatCitation] = []
+    context_parts = []
+    citations     = []
     for sim, doc in ranked[:_RAG_TOP_K]:
         if sim < _RAG_SIM_THRESHOLD:
             break
@@ -94,7 +170,18 @@ async def _rag_context(uid: str, prompt: str, db: firestore.AsyncClient) -> tupl
             f"Summary: {doc['summary']}\n"
             f"Report text: {doc['raw_text'][:1500]}\n"
         )
-        citations.append(ChatCitation(id=doc["doc_id"], title=doc["title"], filename=doc.get("filename"), type=doc["doc_type"]))
+        citations.append(ChatCitation(
+            id=doc["doc_id"], title=doc["title"],
+            filename=doc.get("filename"), type=doc["doc_type"],
+        ))
+
+    if not context_parts and ranked:
+        _, doc = ranked[0]
+        context_parts.append(
+            f"Document (low relevance match): {doc['title']}\n"
+            f"Summary: {doc['summary']}\n"
+            f"Report text: {doc['raw_text'][:800]}\n"
+        )
 
     context_str = "\n---\n".join(context_parts) if context_parts else "No relevant records found for this question."
     return context_str, citations
@@ -269,44 +356,63 @@ async def ask_inside_session(
     db: firestore.AsyncClient,
     model: Optional[str] = None,
 ) -> ChatResponse:
-    """Multi-turn RAG query inside a session. Persists both turns to the session history."""
-    doc_ref  = db.collection(settings.CHAT_SESSIONS_COLLECTION).document(session_id)
-    snap     = await doc_ref.get()
+    """Multi-turn query inside a session. Tries tool calling first, falls back to RAG."""
+    doc_ref = db.collection(settings.CHAT_SESSIONS_COLLECTION).document(session_id)
+    snap    = await doc_ref.get()
     if not snap.exists:
         raise ValueError(f"Session {session_id} not found.")
     d = snap.to_dict()
     _get_session(d, patient_id, session_id)
 
     messages_raw = d.get("messages", [])
-
-    # 1. RAG retrieval
-    context_str, sources = await _rag_context(patient_id, prompt, db)
-
-    # 2. Conversation history (last N messages as context)
     history_lines = [
         f"{'Patient' if m['role'] == 'user' else 'AI Companion'}: {m['content']}"
         for m in messages_raw[-_HISTORY_WINDOW:]
     ]
-    history_str = "\n".join(history_lines) if history_lines else "No previous conversation."
+    history_str = "\n".join(history_lines) if history_lines else ""
+    today       = datetime.date.today().isoformat()
 
-    # 3. Grounded Gemini call
-    reply = await async_generate_gemini_content(
-        f"{_SYSTEM_PROMPT}\n"
-        f"--- Patient Medical Context ---\n{context_str}\n\n"
-        f"--- Conversation History ---\n{history_str}\n\n"
-        f"--- Patient Question ---\n{prompt}\n\nResponse:",
-        json_response=False,
-        model=model,
-    )
+    # 1. Try tool calling — returns ("tool", name, args) | ("text", question) | None
+    tool_result = await try_tool_call(prompt, history_str, today)
+    sources: list[ChatCitation] = []
 
-    # 4. Persist both turns (sources belong only to the model reply)
+    if tool_result and tool_result[0] == "tool":
+        _, tool_name, tool_args = tool_result
+        tool_output = await execute_tool(tool_name, tool_args, patient_id, db)
+        reply = await async_generate_gemini_content(
+            f"{_SYSTEM_PROMPT}\n"
+            f"--- Tool Result ({tool_name}) ---\n{tool_output}\n\n"
+            f"--- Conversation History ---\n{history_str}\n\n"
+            f"Patient asked: {prompt}\n\n"
+            "Respond naturally and helpfully based on the tool result above.",
+            json_response=False,
+            model=model,
+        )
+
+    elif tool_result and tool_result[0] == "text":
+        # Gemini asked a clarifying question — return it directly without RAG
+        reply = tool_result[1]
+
+    else:
+        # 2. Fall back to RAG for medical questions
+        context_str, sources = await _rag_context(patient_id, prompt, db)
+        reply = await async_generate_gemini_content(
+            f"{_SYSTEM_PROMPT}\n"
+            f"--- Patient Medical Context ---\n{context_str}\n\n"
+            f"--- Conversation History ---\n{history_str}\n\n"
+            f"--- Patient Question ---\n{prompt}\n\nResponse:",
+            json_response=False,
+            model=model,
+        )
+
+    # 3. Persist both turns
     now = datetime.datetime.now(datetime.UTC)
     messages_raw.append({"role": "user",  "content": prompt, "created_at": now, "sources": []})
     messages_raw.append({"role": "model", "content": reply,  "created_at": now,
                          "sources": [c.model_dump() for c in sources]})
 
     update: dict = {"messages": messages_raw, "updated_at": now}
-    if len(messages_raw) == 2 and not d.get("title"):  # first exchange, no title yet
+    if len(messages_raw) == 2 and not d.get("title"):
         update["title"] = await _generate_session_title(prompt)
     await doc_ref.update(update)
 
@@ -378,29 +484,65 @@ async def stream_session_ask(
         yield _sse("error", message=str(e))
         return
 
-    messages_raw = d.get("messages", [])
-
-    try:
-        context_str, sources = await _rag_context(patient_id, prompt, db)
-    except Exception as e:
-        yield _sse("error", message=f"Failed to retrieve medical context: {e}")
-        return
-
-    yield _sse("sources", sources=sources)
-
+    messages_raw  = d.get("messages", [])
     history_lines = [
         f"{'Patient' if m['role'] == 'user' else 'AI Companion'}: {m['content']}"
         for m in messages_raw[-_HISTORY_WINDOW:]
     ]
-    history_str = "\n".join(history_lines) if history_lines else "No previous conversation."
+    history_str = "\n".join(history_lines) if history_lines else ""
+    today       = datetime.date.today().isoformat()
 
-    gemini_prompt = (
-        f"{_SYSTEM_PROMPT}\n"
-        f"--- Patient Medical Context ---\n{context_str}\n\n"
-        f"--- Conversation History ---\n{history_str}\n\n"
-        f"--- Patient Question ---\n{prompt}\n\nResponse:"
-    )
+    # 1. Try tool calling — returns ("tool", name, args) | ("text", question) | None
+    sources: list[ChatCitation] = []
+    tool_result = await try_tool_call(prompt, history_str, today)
 
+    if tool_result and tool_result[0] == "tool":
+        _, tool_name, tool_args = tool_result
+        yield _sse("tool_call", tool=tool_name)
+        try:
+            tool_output = await execute_tool(tool_name, tool_args, patient_id, db)
+        except Exception as e:
+            yield _sse("error", message=f"Tool execution failed: {e}")
+            return
+        yield _sse("tool_result", tool=tool_name, output=tool_output)
+        gemini_prompt = (
+            f"{_SYSTEM_PROMPT}\n"
+            f"--- Tool Result ({tool_name}) ---\n{tool_output}\n\n"
+            f"--- Conversation History ---\n{history_str}\n\n"
+            f"Patient asked: {prompt}\n\n"
+            "Respond naturally and helpfully based on the tool result above."
+        )
+
+    elif tool_result and tool_result[0] == "text":
+        # Gemini asked a clarifying question — stream it directly, skip RAG
+        clarification = tool_result[1]
+        yield _sse("chunk", content=clarification)
+        yield _sse("done")
+        now = datetime.datetime.now(datetime.UTC)
+        messages_raw.append({"role": "user",  "content": prompt,        "created_at": now, "sources": []})
+        messages_raw.append({"role": "model", "content": clarification, "created_at": now, "sources": []})
+        update: dict = {"messages": messages_raw, "updated_at": now}
+        if len(messages_raw) == 2 and not d.get("title"):
+            update["title"] = await _generate_session_title(prompt)
+        await doc_ref.update(update)
+        return
+
+    else:
+        # 2. Fall back to RAG for medical questions
+        try:
+            context_str, sources = await _rag_context(patient_id, prompt, db)
+        except Exception as e:
+            yield _sse("error", message=f"Failed to retrieve medical context: {e}")
+            return
+        yield _sse("sources", sources=[c.model_dump() for c in sources])
+        gemini_prompt = (
+            f"{_SYSTEM_PROMPT}\n"
+            f"--- Patient Medical Context ---\n{context_str}\n\n"
+            f"--- Conversation History ---\n{history_str}\n\n"
+            f"--- Patient Question ---\n{prompt}\n\nResponse:"
+        )
+
+    # 3. Stream Gemini response
     reply_chunks: list[str] = []
     try:
         async for chunk in stream_gemini_content(gemini_prompt, model=model):
@@ -412,7 +554,7 @@ async def stream_session_ask(
 
     yield _sse("done")
 
-    # Persist after stream so Firestore write never blocks the client
+    # Persist after stream — never blocks the client
     full_reply = "".join(reply_chunks)
     now = datetime.datetime.now(datetime.UTC)
     messages_raw.append({"role": "user",  "content": prompt,     "created_at": now, "sources": []})
@@ -420,6 +562,6 @@ async def stream_session_ask(
                          "sources": [c.model_dump() for c in sources]})
 
     update: dict = {"messages": messages_raw, "updated_at": now}
-    if len(messages_raw) == 2 and not d.get("title"):  # first exchange, no title yet
+    if len(messages_raw) == 2 and not d.get("title"):
         update["title"] = await _generate_session_title(prompt)
     await doc_ref.update(update)
