@@ -1,0 +1,32 @@
+{
+  "medicine": {
+    "default_title": "Time for your medicine, {patient_first_name}! ⏰",
+    "default_body": "Please take your {medicine_name} ({meal_relation}).",
+    "deeplink_template": "/reminders/{reminder_id}"
+  },
+  "consultation": {
+    "default_title": "Hello {patient_first_name}, consultation scheduled 🩺",
+    "default_body": "Your appointment with {doctor_name} is set for {appointment_time}.",
+    "deeplink_template": "/consultations/{consultation_id}"
+  },
+  "report": {
+    "default_title": "Your medical report is ready 📄",
+    "default_body": "Hi {patient_first_name}, your {document_type} summary ({document_name}) is now available.",
+    "deeplink_template": "/documents/{document_id}"
+  },
+  "vitals": {
+    "default_title": "Log your vitals, {patient_first_name} 📈",
+    "default_body": "Keep your health tracker up to date by logging weight & height.",
+    "deeplink_template": "/vitals"
+  },
+  "chat": {
+    "default_title": "New message from assistant 💬",
+    "default_body": "Hi {patient_first_name}, I have processed your request. Click here to chat.",
+    "deeplink_template": "/chatbot/{session_id}"
+  },
+  "general": {
+    "default_title": "Update from Health Companion 🔔",
+    "default_body": "Hello {patient_first_name}, you have a new update.",
+    "deeplink_template": "/"
+  }
+}
