@@ -141,6 +141,7 @@ class DocumentListItem(BaseModel):
     document_date:  Optional[str]     = None
     consultation_id: Optional[str]   = None
     warnings:       List[str]         = Field(default=[])
+    red_flags:      List[str]         = Field(default=[])
     created_at:     datetime
 
 

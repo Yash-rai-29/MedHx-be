@@ -1,5 +1,8 @@
+import asyncio
 import datetime
-from fastapi import APIRouter, Depends, HTTPException, status, Request
+import time
+from collections import defaultdict
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import HTMLResponse
 from google.cloud import firestore
 from typing import List
@@ -33,6 +36,21 @@ router = APIRouter()
 # Patient endpoints require the 'patient' role
 patient_gate = require_role(["patient"])
 
+# ── SOS rate limiter (in-memory, per-IP, 10 req/min) ─────────────────────────
+_sos_ip_times: dict[str, list[float]] = defaultdict(list)
+_sos_lock = asyncio.Lock()
+
+async def _sos_rate_limit(request: Request) -> None:
+    client_ip = request.client.host if request.client else "unknown"
+    now = time.monotonic()
+    window, max_req = 60.0, 10
+    async with _sos_lock:
+        times = [t for t in _sos_ip_times[client_ip] if now - t < window]
+        if len(times) >= max_req:
+            raise HTTPException(status_code=429, detail="Too many requests. Please try again later.")
+        times.append(now)
+        _sos_ip_times[client_ip] = times
+
 @router.get("", response_model=PatientProfileResponse)
 async def get_profile(
     current_user: dict = Depends(patient_gate),
@@ -46,7 +64,7 @@ async def get_profile(
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
 
-@router.put("", response_model=PatientProfileResponse)
+@router.patch("", response_model=PatientProfileResponse)
 async def update_profile(
     req: PatientProfileUpdateRequest,
     current_user: dict = Depends(patient_gate),
@@ -78,12 +96,13 @@ async def add_vitals(
 
 @router.get("/vitals/history", response_model=List[VitalsLogResponse])
 async def get_vitals_history(
+    limit: int = Query(90, ge=1, le=365, description="Maximum number of vitals entries to return"),
     current_user: dict = Depends(patient_gate),
     db: firestore.AsyncClient = Depends(get_db)
 ):
-    """Retrieves list of all logged weight and BMI data trend points over time."""
+    """Retrieves weight/BMI data trend points, newest first. Default 90 entries, max 365."""
     uid = current_user.get("uid")
-    history = await get_patient_vitals_history(uid, db)
+    history = await get_patient_vitals_history(uid, db, limit=limit)
     return history
 
 @router.get("/passport", response_model=QRPassportResponse)
@@ -246,7 +265,9 @@ async def register_fcm_token(
 @router.get("/sos/{uid}", response_class=HTMLResponse)
 async def get_public_sos_card(
     uid: str,
-    db: firestore.AsyncClient = Depends(get_db)
+    request: Request,
+    db: firestore.AsyncClient = Depends(get_db),
+    _: None = Depends(_sos_rate_limit),
 ):
     """
     Public unauthenticated endpoint to retrieve critical patient SOS metadata.

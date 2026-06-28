@@ -20,6 +20,117 @@ Includes two microservices:
 
 ---
 
+## System Architecture
+
+The patient service is the sole deployed backend. All features are patient-facing — there is no doctor-side API in the current system.
+
+```mermaid
+flowchart TD
+    %% ── Client ───────────────────────────────────────────────────────────────
+    subgraph CLIENT["📱 Flutter Mobile App"]
+        APP[Flutter Client]
+    end
+
+    %% ── Google Cloud Platform ────────────────────────────────────────────────
+    subgraph GCP["☁️ Google Cloud Platform"]
+
+        FBAUTH["🔐 Firebase Auth\nID Token Verification"]
+
+        subgraph CR["Cloud Run · FastAPI Patient Service"]
+            direction LR
+            PROFILE["/profile · /vitals"]
+            CONSULT["/consultations"]
+            DOCEP["/documents"]
+            REMIND["/reminders"]
+            CHAT["/chatbot"]
+            DASH["/dashboard"]
+        end
+
+        subgraph FS["🗄️ Cloud Firestore"]
+            direction LR
+            FPat[(patients)]
+            FCons[(audio_consultations)]
+            FDoc[(documents)]
+            FRem[(reminders)]
+            FVit[(vitals)]
+            FVec[("Vector Search\ntext-embedding-004")]
+        end
+
+        GCS[("☁️ Cloud Storage\nAudio · Documents · TTS Cache")]
+        CT["⏰ Cloud Tasks\nReminder Queue"]
+        FCM["🔔 Firebase FCM\nPush Notifications"]
+    end
+
+    %% ── External AI Services ─────────────────────────────────────────────────
+    subgraph AI["🤖 External AI Services"]
+        SCRIBE["ElevenLabs Scribe\nSTT + Speaker Diarization\n10 Indian Languages"]
+        TTS["ElevenLabs TTS\n10 Regional Voice IDs"]
+        GEMINI["Gemini 2.5 Flash\nClinical Extraction · RAG\nChatbot · Role Inference · Embeddings"]
+        DOCAI["Google Document AI\nMedical OCR"]
+    end
+
+    %% ── Auth Flow ────────────────────────────────────────────────────────────
+    APP -->|"Bearer ID Token"| FBAUTH
+    FBAUTH -->|"uid verified"| CR
+    APP -->|"REST API calls"| CR
+
+    %% ── GCS Direct Upload (bypasses Cloud Run) ───────────────────────────────
+    APP -. "Direct upload\nvia signed URL" .-> GCS
+
+    %% ── Consultation Pipeline ────────────────────────────────────────────────
+    CONSULT -->|"Audio file URL"| SCRIBE
+    SCRIBE -->|"Diarized transcript\n+ speaker labels"| CONSULT
+    CONSULT -->|"Summary text + language"| TTS
+    TTS -->|"MP3 — cached in GCS"| GCS
+
+    %% ── Document Pipeline ────────────────────────────────────────────────────
+    DOCEP -->|"PDF / image via GCS path"| DOCAI
+    DOCAI -->|"OCR text"| DOCEP
+
+    %% ── Gemini Calls ─────────────────────────────────────────────────────────
+    CONSULT -->|"Transcript → extract diagnoses,\nmedicines, red flags, title"| GEMINI
+    DOCEP   -->|"OCR text → extract summary,\nabnormal labs, red flags"| GEMINI
+    CHAT    -->|"Question + RAG chunks\n→ grounded answer"| GEMINI
+    GEMINI  -->|"Structured JSON + embeddings"| CONSULT
+    GEMINI  -->|"Structured JSON + embeddings"| DOCEP
+    GEMINI  -->|"Answer in patient language"| CHAT
+
+    %% ── Vector Search (RAG) ──────────────────────────────────────────────────
+    CONSULT -->|"Embed + store chunks"| FVec
+    DOCEP   -->|"Embed + store chunks"| FVec
+    CHAT    -->|"Query top-k similar chunks"| FVec
+
+    %% ── Firestore CRUD ───────────────────────────────────────────────────────
+    PROFILE -->|"Read / Write"| FPat
+    PROFILE -->|"Read / Write"| FVit
+    CONSULT -->|"Read / Write"| FCons
+    DOCEP   -->|"Read / Write"| FDoc
+    REMIND  -->|"Read / Write"| FRem
+    DASH    -->|"3 parallel queries\nasyncio.gather"| FPat
+    DASH    -->|"3 parallel queries\nasyncio.gather"| FRem
+    DASH    -->|"3 parallel queries\nasyncio.gather"| FVit
+
+    %% ── Reminder Trigger Loop (Cloud Tasks) ──────────────────────────────────
+    REMIND -->|"Enqueue task at scheduled time"| CT
+    CT     -->|"POST /trigger\nCloud Tasks secret header"| REMIND
+    REMIND -->|"Send push notification"| FCM
+    FCM    -->|"Push to device"| APP
+```
+
+### Key Design Decisions
+
+| Decision | Detail |
+|---|---|
+| **Direct GCS upload** | Flutter uploads audio and documents directly to Cloud Storage via signed URLs — large files never pass through Cloud Run |
+| **Reminder idempotency** | Cloud Tasks delivers at-least-once; a Firestore `@async_transactional` guard checks `last_triggered_at ± 5s` to prevent duplicate notifications |
+| **RAG grounding** | Chatbot answers are sourced exclusively from the patient's own consultations and documents via Firestore Vector Search — no generic internet data |
+| **TTS caching** | Generated audio is stored in GCS after the first request; repeat listens cost zero API calls |
+| **Parallel dashboard reads** | `/dashboard` fires 3 Firestore queries concurrently via `asyncio.gather(return_exceptions=True)`; any single failure degrades gracefully |
+| **Prompt injection mitigation** | All patient-supplied free text (document title, chat messages) is wrapped in delimiter tags before being included in Gemini prompts |
+| **FCM token pruning** | On `UnregisteredError` from FCM, the stale token is deleted from Firestore using `DELETE_FIELD` |
+
+---
+
 ## Directory Structure
 ```
 AI-Health/

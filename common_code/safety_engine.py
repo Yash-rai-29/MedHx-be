@@ -54,19 +54,28 @@ async def run_safety_checks(
     """
     allergies = patient_profile.get("allergies", [])
     current_meds = patient_profile.get("current_medications", [])
-    age = patient_profile.get("age") or 30 # default
-    weight = patient_profile.get("weight") or 60.0 # default
-    
+    age = patient_profile.get("age")
+    weight = patient_profile.get("weight") or 60.0
+
+    setup_warnings: list[str] = []
+    if not age:
+        setup_warnings.append(
+            "Patient age is not set in their profile. Dosage safety checks could not be run. "
+            "Please complete the patient profile before prescribing."
+        )
+        age = None  # pass None so dosing checks are skipped, not run against a fake age
+
     # Run individual checks
     allergy_conflicts = check_allergy_conflicts(allergies, prescribed_medicines)
     drug_interactions = await check_drug_interactions(db, current_meds, prescribed_medicines)
     duplicate_therapies = check_duplicate_therapies(current_meds, prescribed_medicines)
-    dosing_warnings = check_dosing_warnings(age, weight, prescribed_medicines)
-    
+    dosing_warnings = check_dosing_warnings(age or 0, weight, prescribed_medicines) if age else []
+
     is_safe = not (allergy_conflicts or drug_interactions or duplicate_therapies or dosing_warnings)
-    
+
     return {
         "is_safe": is_safe,
+        "setup_warnings": setup_warnings,
         "allergy_conflicts": allergy_conflicts,
         "drug_interactions": drug_interactions,
         "duplicate_therapies": duplicate_therapies,

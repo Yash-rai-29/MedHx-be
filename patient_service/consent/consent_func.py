@@ -1,5 +1,6 @@
 import random
 import datetime
+from datetime import UTC
 import uuid
 from google.cloud import firestore
 from common_code.config import settings
@@ -9,7 +10,7 @@ async def generate_consent_otp(uid: str, db: firestore.AsyncClient) -> ConsentGe
     """Generates a random 6-digit access code for doctors to request patient profile access."""
     # Generate 6-digit OTP
     code = f"{random.randint(100000, 999999)}"
-    expiry = datetime.datetime.utcnow() + datetime.timedelta(minutes=15)
+    expiry = datetime.datetime.now(UTC) + datetime.timedelta(minutes=15)
     
     consent_id = str(uuid.uuid4())
     consent_doc = {
@@ -17,10 +18,10 @@ async def generate_consent_otp(uid: str, db: firestore.AsyncClient) -> ConsentGe
         "patientId": uid,
         "accessCode": code,
         "scope": "full_history",
-        "grantedAt": datetime.datetime.utcnow(),
+        "grantedAt": datetime.datetime.now(UTC),
         "expiresAt": expiry,
         "status": "pending",  # pending input from doctor side
-        "createdAt": datetime.datetime.utcnow()
+        "createdAt": datetime.datetime.now(UTC)
     }
     
     await db.collection(settings.CONSENTS_COLLECTION).document(consent_id).set(consent_doc)
@@ -32,7 +33,7 @@ async def generate_consent_otp(uid: str, db: firestore.AsyncClient) -> ConsentGe
 
 async def get_patient_active_grants(uid: str, db: firestore.AsyncClient) -> list[ConsentRecordResponse]:
     """Retrieves all active session grants issued by the patient."""
-    now = datetime.datetime.utcnow()
+    now = datetime.datetime.now(UTC)
     docs = await db.collection(settings.CONSENTS_COLLECTION) \
         .where("patientId", "==", uid) \
         .where("status", "==", "active") \

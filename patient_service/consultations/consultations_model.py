@@ -46,6 +46,12 @@ class TranslateSummaryResponse(BaseModel):
 #  Audio consultation models — patient-uploaded recordings
 # ══════════════════════════════════════════════════════════════
 
+class ICDCode(BaseModel):
+    """ICD-10-CM code extracted from a consultation transcript by Gemini."""
+    code:        str = Field(..., description="ICD-10-CM code (e.g. E11.9, J06.9)")
+    description: str = Field(..., description="Standard ICD-10 condition name")
+
+
 class AudioConsultationStatus(str, Enum):
     pending     = "pending"
     in_progress = "in_progress"
@@ -97,6 +103,7 @@ class AudioConsultationListItem(BaseModel):
     summary:        Optional[str]           = None
     doctor_name:    Optional[str]           = None
     key_diagnoses:  Optional[List[str]]     = None
+    icd_codes:      Optional[List[ICDCode]] = None
     error_message:  Optional[str]           = None
     created_at:     datetime
 
@@ -107,17 +114,18 @@ class AudioConsultationResponse(BaseModel):
     id:                    str
     status:                AudioConsultationStatus
     file_path:             str
-    title:                 Optional[str]                  = None
-    language:              SupportedLanguage              = SupportedLanguage.english
-    transcript:            Optional[str]                  = None
-    segments:              Optional[List[DiarizedSegment]]     = None
-    medicines:             Optional[List[ExtractedMedicine]]   = None
-    reminder_suggestions:  Optional[List[ReminderSuggestion]]  = None
-    key_diagnoses:         Optional[List[str]]            = None
-    summary:               Optional[str]                  = None
-    doctor_name:           Optional[str]                  = None
-    attached_documents:    Optional[List[AttachedDocument]] = None
-    error_message:         Optional[str]                  = None
+    title:                 Optional[str]                      = None
+    language:              SupportedLanguage                  = SupportedLanguage.english
+    transcript:            Optional[str]                      = None
+    segments:              Optional[List[DiarizedSegment]]    = None
+    medicines:             Optional[List[ExtractedMedicine]]  = None
+    reminder_suggestions:  Optional[List[ReminderSuggestion]] = None
+    key_diagnoses:         Optional[List[str]]                = None
+    icd_codes:             Optional[List[ICDCode]]            = None
+    summary:               Optional[str]                      = None
+    doctor_name:           Optional[str]                      = None
+    attached_documents:    Optional[List[AttachedDocument]]   = None
+    error_message:         Optional[str]                      = None
     created_at:            datetime
 
 

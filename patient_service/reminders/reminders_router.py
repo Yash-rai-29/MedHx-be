@@ -192,7 +192,7 @@ async def trigger_endpoint(
     Handles both relay (reschedule silently) and notify (send notification + chain) types.
     """
     expected = settings.CLOUD_TASKS_SECRET or "local-tasks-secret"
-    if settings.ENVIRONMENT == "production":
+    if settings.ENVIRONMENT != "local":
         if not x_cloud_tasks_secret or x_cloud_tasks_secret != expected:
             raise HTTPException(status_code=401, detail="Unauthorized Cloud Task request.")
     try:

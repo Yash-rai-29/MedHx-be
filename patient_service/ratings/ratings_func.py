@@ -1,4 +1,5 @@
 import datetime
+from datetime import UTC
 from google.cloud import firestore
 from common_code.config import settings
 from patient_service.ratings.ratings_model import RatingCreateRequest, RatingResponse
@@ -35,7 +36,7 @@ async def create_doctor_rating(
         raise ValueError("A rating has already been submitted for this consultation.")
         
     # Create rating document
-    created_at = datetime.datetime.utcnow()
+    created_at = datetime.datetime.now(UTC)
     rating_doc = {
         "patient_id": patient_id,
         "doctor_id": req.doctor_id,

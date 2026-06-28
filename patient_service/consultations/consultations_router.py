@@ -44,13 +44,13 @@ _ALLOWED_MIME = {
 #  List (no path param — must come first to avoid /{id} clash)
 # ══════════════════════════════════════════════════════════════
 
-@router.get("", response_model=List[PatientConsultationDetail])
-async def get_consultations(
-    current_user: dict = Depends(patient_gate),
-    db: firestore.AsyncClient = Depends(get_db),
-):
-    """Lists all finalized doctor-published consultation summaries for the patient."""
-    return await get_patient_consultations(current_user["uid"], db)
+# @router.get("", response_model=List[PatientConsultationDetail])
+# async def get_consultations(
+#     current_user: dict = Depends(patient_gate),
+#     db: firestore.AsyncClient = Depends(get_db),
+# ):
+#     """Lists all finalized doctor-published consultation summaries for the patient."""
+#     return await get_patient_consultations(current_user["uid"], db)
 
 
 # ══════════════════════════════════════════════════════════════

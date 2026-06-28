@@ -9,6 +9,7 @@ from google.cloud import firestore
 
 from common_code.config import settings
 from common_code.notification_dispatcher import dispatch_notification
+from common_code.pii_masker import mask_pii
 from common_code.gcp_clients import (
     async_generate_gemini_content,
     async_upload_bytes_to_gcs,
@@ -28,6 +29,7 @@ from patient_service.consultations.consultations_model import (
     AudioConsultationUploadResponse,
     DiarizedSegment,
     ExtractedMedicine,
+    ICDCode,
     PatientConsultationDetail,
     RefineConsultationRequest,
     ReminderSuggestion,
@@ -37,6 +39,15 @@ from patient_service.documents.documents_model import LANGUAGE_DISPLAY_NAMES, Su
 logger = logging.getLogger(__name__)
 
 _COLL = settings.AUDIO_CONSULTATIONS_COLLECTION  # "audio_consultations"
+
+# Valid MealTiming enum values — kept here to avoid a circular import from reminders_model.
+# If reminders_model.MealTiming gains new values, update this set too.
+_VALID_MEAL_TIMINGS = frozenset({
+    "before_breakfast", "after_breakfast",
+    "before_lunch",     "after_lunch",
+    "before_dinner",    "after_dinner",
+    "specific_time",
+})
 
 
 # ══════════════════════════════════════════════════════════════
@@ -184,6 +195,8 @@ async def upload_audio_consultation(
         "doctor_name":           None,
         "key_diagnoses":         None,
         "attached_document_ids": [],
+        "icd_codes":             None,
+        "pii_map":               {},
         "error_message":         None,
         "created_at":            now,
     }
@@ -217,6 +230,12 @@ Return this exact JSON structure:
   "summary": "<patient-friendly summary in {language_name} — if not a medical consultation write a one-sentence note saying so>",
   "doctor_name": "<doctor name if spoken, null otherwise>",
   "key_diagnoses": ["<only diagnoses explicitly stated>"],
+  "icd_codes": [
+    {{
+      "code": "<ICD-10-CM code e.g. E11.9>",
+      "description": "<standard ICD-10 condition name>"
+    }}
+  ],
   "medicines": [
     {{
       "name": "<exact medicine name as spoken>",
@@ -257,12 +276,14 @@ Return this exact JSON structure:
 }}
 
 Additional rules:
+- icd_codes: map each entry in key_diagnoses to its ICD-10-CM code. Only include codes you are certain about — omit an entry rather than guessing. Return [] if no diagnoses were explicitly stated.
 - medicine reminder → type = "medicine", fill medicine_details, set follow_up_details to null
 - follow_up reminder → type = "follow_up", fill follow_up_details, set medicine_details to null
 - recurrence for follow-up appointments is usually "once"
-- If a medicine is prescribed twice daily, create two reminder_suggestions (morning and evening)
+- Create EXACTLY ONE reminder_suggestion per distinct medicine name. Do NOT create multiple suggestions for the same medicine. For medicines taken multiple times per day (e.g. "3 times daily"), set time_of_day to the morning/first dose time (e.g. "08:00") and put the full dosing schedule in the notes field (e.g. "3 times daily — 8 AM, 2 PM, 8 PM"). The patient can add extra reminders themselves if needed.
 - start_date and appointment_date are always null — the patient sets them when confirming
 - Return [] for any array with no valid data — never omit a key
+- meal_timing must be exactly one of these values or null: before_breakfast, after_breakfast, before_lunch, after_lunch, before_dinner, after_dinner, specific_time. Do NOT use any other string — not "before_meals", "after_meals", "post_meal", "pre_meal", or similar. If the transcript says "before meals" / "after meals" and you cannot determine which specific meal, set meal_timing to null and set time_of_day instead (e.g. "08:00" for morning, "13:00" for afternoon, "20:00" for evening).
 
 Transcript:
 {transcript}"""
@@ -292,6 +313,7 @@ async def _infer_speaker_roles(segments: list[dict]) -> dict[str, str]:
         for s in sample
         if s.get("speaker_id") and s.get("text")
     )
+    sample_text = mask_pii(sample_text).masked_text  # strip PII before sending to Gemini
 
     prompt = (
         "You are analysing a medical consultation transcript that has been automatically labelled "
@@ -375,10 +397,17 @@ async def background_process_audio_consultation(
             })
             return
 
-        # ── 1b. Speaker role inference + title (parallel with extraction) ──
+        # ── 1b. Mask PII before any LLM call ────────────────────────────────
+        pii_result       = mask_pii(transcript)
+        masked_transcript = pii_result.masked_text
+        pii_map           = pii_result.replacement_map
+        if pii_map:
+            logger.info(f"[{consultation_id}] Masked {len(pii_map)} PII token(s) before LLM calls.")
+
+        # ── 1c. Speaker role inference + title (parallel, both use masked text)
         role_map, consultation_title = await asyncio.gather(
             _infer_speaker_roles(raw_segments),
-            _generate_consultation_title(transcript, language),
+            _generate_consultation_title(masked_transcript, language),
         )
 
         # Build enriched segments: attach named role to each speaker segment
@@ -394,52 +423,67 @@ async def background_process_audio_consultation(
             if s.get("text", "").strip()
         ]
 
-        # ── 2. Gemini extraction ─────────────────────────────────
-        prompt   = _extraction_prompt(transcript, LANGUAGE_DISPLAY_NAMES.get(language, "English"))
+        # ── 2. Gemini extraction (masked transcript) ─────────────────────────
+        prompt   = _extraction_prompt(masked_transcript, LANGUAGE_DISPLAY_NAMES.get(language, "English"))
         raw_json = await async_generate_gemini_content(prompt, json_response=True)
 
         try:
             extracted = json.loads(raw_json)
         except json.JSONDecodeError:
-            logger.warning(f"Gemini returned non-JSON for {consultation_id}: {raw_json[:200]}")
-            extracted = {}
+            logger.warning(f"[{consultation_id}] Gemini returned non-JSON: {raw_json[:200]}")
+            await doc_ref.update({
+                "status":        AudioConsultationStatus.failed.value,
+                "transcript":    transcript,   # store original, not masked
+                "pii_map":       pii_map,
+                "error_message": "Clinical extraction failed — AI returned an unreadable response. Please try again.",
+            })
+            return
 
-        summary            = extracted.get("summary", "")
-        doctor_name        = extracted.get("doctor_name")
-        is_medical         = bool(extracted.get("is_medical_consultation", True))
+        summary     = extracted.get("summary", "")
+        doctor_name = extracted.get("doctor_name")
+        is_medical  = bool(extracted.get("is_medical_consultation", True))
 
         if not is_medical:
             logger.info(f"[{consultation_id}] Gemini flagged as non-medical — skipping clinical extraction.")
             key_diagnoses = []
+            icd_codes     = []
             medicines     = []
             suggestions   = []
         else:
             key_diagnoses = extracted.get("key_diagnoses") or []
-            medicines     = [m for m in (extracted.get("medicines") or []) if isinstance(m, dict) and m.get("name")]
-            raw_sugg      = [s for s in (extracted.get("reminder_suggestions") or []) if isinstance(s, dict) and s.get("title")]
 
-            # Secondary guard: drop any medicine suggestion whose name does not appear
-            # in the transcript — catches hallucinated medicine names.
+            # Parse ICD codes — validate structure, drop malformed entries
+            icd_codes = []
+            for item in (extracted.get("icd_codes") or []):
+                if isinstance(item, dict) and item.get("code") and item.get("description"):
+                    icd_codes.append({"code": item["code"], "description": item["description"]})
+
+            medicines = [m for m in (extracted.get("medicines") or []) if isinstance(m, dict) and m.get("name")]
+            raw_sugg  = [s for s in (extracted.get("reminder_suggestions") or []) if isinstance(s, dict) and s.get("title")]
+
+            # Secondary guard: drop medicine suggestions whose name does not appear in the
+            # original transcript — catches hallucinations from the masked version.
             transcript_lower = transcript.lower()
             suggestions = []
             for s in raw_sugg:
                 if s.get("type") == "medicine":
                     med_name = (s.get("medicine_details") or {}).get("name") or s.get("title", "")
-                    # Keep only if any word of the medicine name (≥4 chars) appears in transcript
                     words = [w for w in med_name.lower().split() if len(w) >= 4]
                     if words and not any(w in transcript_lower for w in words):
                         logger.info(f"[{consultation_id}] Dropping hallucinated medicine suggestion: {med_name}")
                         continue
                 suggestions.append(s)
 
-        # ── 3. Persist ───────────────────────────────────────────
+        # ── 3. Persist — store ORIGINAL transcript (PII intact) ───────────────
         update: dict = {
             "status":               AudioConsultationStatus.completed.value,
-            "transcript":           transcript,
+            "transcript":           transcript,       # original, PII present — stored in patient's own doc
+            "pii_map":              pii_map,          # placeholder→original map for audit
             "segments":             enriched_segments,
             "summary":              summary,
             "doctor_name":          doctor_name,
             "key_diagnoses":        key_diagnoses,
+            "icd_codes":            icd_codes,
             "medicines":            medicines,
             "reminder_suggestions": suggestions,
             "error_message":        None,
@@ -513,14 +557,23 @@ def _parse_suggestions(raw: list) -> list[ReminderSuggestion]:
             # Default schedule if entirely missing
             if not s.get("schedule"):
                 s["schedule"] = {"recurrence": "daily", "time_of_day": "09:00"}
-            # Normalize meal_timing spaces → underscores (Gemini may return "before breakfast")
-            sched = s["schedule"]
-            if isinstance(sched, dict) and isinstance(sched.get("meal_timing"), str):
-                sched["meal_timing"] = sched["meal_timing"].strip().lower().replace(" ", "_")
+            # Normalize and validate meal_timing. Gemini may return generic strings
+            # like "before_meals" that are not valid MealTiming enum values.
+            # Clear them so the time_of_day fallback is used rather than the whole
+            # suggestion being dropped by a Pydantic ValidationError.
+            sched = s.get("schedule") or {}
+            if isinstance(sched, dict):
+                mt = sched.get("meal_timing")
+                if isinstance(mt, str):
+                    normalized = mt.strip().lower().replace(" ", "_")
+                    sched["meal_timing"] = normalized if normalized in _VALID_MEAL_TIMINGS else None
+                s["schedule"] = sched
 
             out.append(ReminderSuggestion(**s))
         except Exception as e:
-            logger.warning(f"Skipping malformed suggestion: {e}")
+            logger.warning(
+                f"Skipping malformed suggestion '{s.get('title', '?')}': {e} | raw={s}"
+            )
     return out
 
 
@@ -535,7 +588,29 @@ async def _to_response(doc_id: str, d: dict, db: firestore.AsyncClient) -> Audio
     raw_medicines   = d.get("medicines")
     raw_suggestions = d.get("reminder_suggestions")
     raw_diagnoses   = d.get("key_diagnoses")
+    raw_icd         = d.get("icd_codes") or []
     raw_ids         = d.get("attached_document_ids") or []
+
+    # Parse segments — guard individually so one corrupt entry never breaks the whole GET
+    segments: Optional[list[DiarizedSegment]] = None
+    if raw_segments is not None:
+        segments = []
+        for s in raw_segments:
+            if not s.get("text"):
+                continue
+            try:
+                segments.append(DiarizedSegment(**s))
+            except Exception as seg_err:
+                logger.warning(f"[{doc_id}] Skipping corrupt segment: {seg_err}")
+
+    # Parse ICD codes
+    icd_codes: list[ICDCode] = []
+    for item in raw_icd:
+        if isinstance(item, dict) and item.get("code") and item.get("description"):
+            try:
+                icd_codes.append(ICDCode(**item))
+            except Exception:
+                pass
 
     # Batch-fetch titles for all attached documents in one round-trip
     attached_documents: Optional[list[AttachedDocument]] = None
@@ -553,11 +628,12 @@ async def _to_response(doc_id: str, d: dict, db: firestore.AsyncClient) -> Audio
         file_path=d.get("file_path", ""),
         title=d.get("title"),
         language=language,
-        transcript=d.get("transcript"),
-        segments=[DiarizedSegment(**s) for s in raw_segments if s.get("text")] if raw_segments is not None else None,
+        transcript=d.get("transcript"),   # original transcript with PII — served only to the patient (auth required)
+        segments=segments,
         medicines=[ExtractedMedicine(**m) for m in raw_medicines if m.get("name")] if raw_medicines is not None else None,
         reminder_suggestions=_parse_suggestions(raw_suggestions) if raw_suggestions is not None else None,
         key_diagnoses=raw_diagnoses if raw_diagnoses is not None else None,
+        icd_codes=icd_codes or None,
         summary=d.get("summary"),
         doctor_name=d.get("doctor_name"),
         attached_documents=attached_documents,
@@ -568,7 +644,7 @@ async def _to_response(doc_id: str, d: dict, db: firestore.AsyncClient) -> Audio
 
 _LIST_FIELDS = [
     "patientId", "status", "file_path", "title", "language",
-    "summary", "doctor_name", "key_diagnoses", "error_message", "created_at",
+    "summary", "doctor_name", "key_diagnoses", "icd_codes", "error_message", "created_at",
 ]
 
 
@@ -579,6 +655,15 @@ def _to_list_item(doc_id: str, d: dict) -> AudioConsultationListItem:
     except ValueError:
         language = SupportedLanguage.english
 
+    raw_icd = d.get("icd_codes") or []
+    icd_codes: list[ICDCode] = []
+    for item in raw_icd:
+        if isinstance(item, dict) and item.get("code") and item.get("description"):
+            try:
+                icd_codes.append(ICDCode(**item))
+            except Exception:
+                pass
+
     return AudioConsultationListItem(
         id=doc_id,
         status=AudioConsultationStatus(d.get("status", "pending")),
@@ -588,6 +673,7 @@ def _to_list_item(doc_id: str, d: dict) -> AudioConsultationListItem:
         summary=d.get("summary"),
         doctor_name=d.get("doctor_name"),
         key_diagnoses=d.get("key_diagnoses") or None,
+        icd_codes=icd_codes or None,
         error_message=d.get("error_message"),
         created_at=d.get("created_at", datetime.now(UTC)),
     )
@@ -639,7 +725,6 @@ async def delete_audio_consultation(
     blob_name = d.get("file_path")
     if blob_name:
         try:
-            import asyncio
             from common_code.gcp_clients import _get_storage
             await asyncio.to_thread(
                 lambda: _get_storage().bucket(settings.STORAGE_BUCKET_NAME).blob(blob_name).delete()
@@ -720,6 +805,7 @@ Return ONLY valid JSON with no markdown:
   "summary": "<updated patient-friendly summary — must include all original content plus the change>",
   "doctor_name": "<string or null>",
   "key_diagnoses": ["<only diagnoses explicitly stated>"],
+  "icd_codes": [{{"code": "<ICD-10-CM code>", "description": "<standard condition name>"}}],
   "medicines": [{{"name": "...", "dosage": "...", "frequency": "...", "instructions": "...", "duration": "..."}}],
   "reminder_suggestions": [
     {{
@@ -730,7 +816,11 @@ Return ONLY valid JSON with no markdown:
       "follow_up_details": {{"specialty": "...", "reason": "...", "urgency": "routine", "appointment_date": null, "appointment_time": null}}
     }}
   ]
-}}"""
+}}
+
+Rules for reminder_suggestions:
+- Create EXACTLY ONE suggestion per distinct medicine name. For medicines taken multiple times per day, set time_of_day to the morning/first dose time and put the full schedule in notes (e.g. "3 times daily — 8 AM, 2 PM, 8 PM").
+- meal_timing must be exactly one of: before_breakfast, after_breakfast, before_lunch, after_lunch, before_dinner, after_dinner, specific_time — or null. Do NOT use "before_meals", "after_meals", "post_meal", or similar."""
 
 
 async def refine_consultation(
@@ -753,8 +843,11 @@ async def refine_consultation(
     if d.get("status") != AudioConsultationStatus.completed.value:
         raise ValueError("Refinement is only available after the consultation has finished processing.")
 
+    original_transcript = d.get("transcript", "")
+    masked_transcript   = mask_pii(original_transcript).masked_text  # strip PII before Gemini
+
     prompt = _refine_prompt(
-        transcript=d.get("transcript", ""),
+        transcript=masked_transcript,
         summary=d.get("summary", ""),
         medicines=d.get("medicines") or [],
         reminder_suggestions=d.get("reminder_suggestions") or [],
@@ -789,6 +882,13 @@ async def refine_consultation(
     new_diagnoses      = [x for x in (extracted.get("key_diagnoses") or []) if isinstance(x, str) and x.strip()]
     key_diagnoses      = existing_diagnoses + [x for x in new_diagnoses if x not in existing_diagnoses]
 
+    # ── ICD codes: use Gemini's updated list if non-empty, else keep existing ─
+    new_icd_raw = [
+        i for i in (extracted.get("icd_codes") or [])
+        if isinstance(i, dict) and i.get("code") and i.get("description")
+    ]
+    icd_codes = new_icd_raw if new_icd_raw else (d.get("icd_codes") or [])
+
     # ── Doctor name: keep existing if Gemini returns nothing ─────────────────
     doctor_name = extracted.get("doctor_name") or d.get("doctor_name")
 
@@ -821,6 +921,7 @@ async def refine_consultation(
         "summary":              summary,
         "doctor_name":          doctor_name,
         "key_diagnoses":        key_diagnoses,
+        "icd_codes":            icd_codes,
         "medicines":            medicines,
         "reminder_suggestions": suggestions,
     })

@@ -314,8 +314,8 @@ async def create_reminder(
         "title":                req.title,
         "notes":                req.notes,
         "schedule":             _schedule_to_dict(req.schedule),
-        "medicine_details":     req.medicine_details.model_dump() if req.medicine_details else None,
-        "follow_up_details":    req.follow_up_details.model_dump() if req.follow_up_details else None,
+        "medicine_details":     req.medicine_details.model_dump(mode="json") if req.medicine_details else None,
+        "follow_up_details":    req.follow_up_details.model_dump(mode="json") if req.follow_up_details else None,
         "consultation_id":      req.consultation_id,
         "notification_enabled": req.notification_enabled,
         "next_trigger_at":      next_dt,
@@ -506,11 +506,44 @@ async def delete_reminder(
 #  Cloud Tasks trigger handler
 # ══════════════════════════════════════════════════════════════
 
+@firestore.async_transactional
+async def _claim_notify_trigger(
+    transaction: firestore.AsyncTransaction,
+    doc_ref: firestore.AsyncDocumentReference,
+    target_at: datetime,
+) -> dict | None:
+    """Atomically claim a notify trigger slot. Returns the reminder dict if this is the
+    first invocation for this target_at, None if already processed or not actionable."""
+    snap = await doc_ref.get(transaction=transaction)
+    if not snap.exists:
+        return None
+    d = snap.to_dict()
+
+    status = d.get("status")
+    if status in (ReminderStatus.cancelled.value, ReminderStatus.expired.value, ReminderStatus.paused.value):
+        return None
+
+    # Idempotency: if last_triggered_at is within 5 s of target_at this task already ran
+    last = d.get("last_triggered_at")
+    if last is not None:
+        if isinstance(last, datetime) and last.tzinfo is None:
+            last = last.replace(tzinfo=UTC)
+        if isinstance(last, datetime) and abs((last - target_at).total_seconds()) < 5:
+            return None
+
+    # Mark claimed — trigger_count and last_triggered_at written inside the transaction
+    transaction.update(doc_ref, {
+        "last_triggered_at": target_at,
+        "trigger_count": firestore.Increment(1),
+    })
+    return d
+
+
 async def handle_trigger(payload: TriggerPayload, db: firestore.AsyncClient) -> None:
     """
     Called by Cloud Tasks at /reminders/trigger.
     relay  → check not cancelled → reschedule same target_at (no notification)
-    notify → check status → if active: notify + chain; else: stop
+    notify → claim atomically (idempotency) → notify + chain; else stop
     """
     reminder_id = payload.reminder_id
     patient_id  = payload.patient_id
@@ -532,14 +565,12 @@ async def handle_trigger(payload: TriggerPayload, db: firestore.AsyncClient) -> 
         return
 
     # ── Notify ─────────────────────────────────────────────────
-    snap = await doc_ref.get()
-    if not snap.exists:
-        return
-
-    d      = snap.to_dict()
-    status = d.get("status")
-
-    if status in (ReminderStatus.cancelled.value, ReminderStatus.expired.value, ReminderStatus.paused.value):
+    # Use a transaction to claim this trigger slot atomically (prevents duplicate
+    # notifications when Cloud Tasks delivers the same task more than once).
+    txn = db.transaction()
+    d = await _claim_notify_trigger(txn, doc_ref, target_at)
+    if d is None:
+        logger.info(f"[trigger] Skipping duplicate or non-actionable trigger for {reminder_id} at {target_at}")
         return
 
     # Send FCM + in-app notification
@@ -552,20 +583,18 @@ async def handle_trigger(payload: TriggerPayload, db: firestore.AsyncClient) -> 
     )
 
     # Chain to next occurrence — re-resolve meal timing so profile changes take effect
-    schedule  = ReminderSchedule(**d["schedule"])
-    resolved  = await _resolve_schedule(schedule, patient_id, db)
-    next_dt   = compute_next_trigger(resolved, after=target_at)
+    try:
+        schedule = _parse_schedule(d)
+    except Exception as e:
+        logger.error(f"[trigger] Malformed schedule for reminder {reminder_id}: {e} — stopping chain")
+        await doc_ref.update({"status": ReminderStatus.expired.value})
+        return
+
+    resolved = await _resolve_schedule(schedule, patient_id, db)
+    next_dt  = compute_next_trigger(resolved, after=target_at)
 
     if next_dt:
         schedule_next_task(reminder_id, patient_id, next_dt)
-        await doc_ref.update({
-            "next_trigger_at":    next_dt,
-            "last_triggered_at":  target_at,
-            "trigger_count":      firestore.Increment(1),
-        })
+        await doc_ref.update({"next_trigger_at": next_dt})
     else:
-        await doc_ref.update({
-            "status":             ReminderStatus.expired.value,
-            "last_triggered_at":  target_at,
-            "trigger_count":      firestore.Increment(1),
-        })
+        await doc_ref.update({"status": ReminderStatus.expired.value})

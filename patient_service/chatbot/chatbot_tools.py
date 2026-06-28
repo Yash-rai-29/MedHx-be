@@ -166,6 +166,36 @@ CHATBOT_TOOLS = genai_types.Tool(
                 required=["reminder_id"],
             ),
         ),
+
+        genai_types.FunctionDeclaration(
+            name="list_consultations",
+            description=(
+                "List all doctor visit recordings (audio consultations) the patient has saved. "
+                "Use when the patient asks to see, show, or list their consultations, "
+                "doctor visits, recordings, or appointments."
+            ),
+            parameters=genai_types.Schema(type="OBJECT", properties={}),
+        ),
+
+        genai_types.FunctionDeclaration(
+            name="get_consultation",
+            description=(
+                "Get the full details of a specific audio consultation: summary, diagnoses, "
+                "ICD codes, prescribed medicines, and reminder suggestions. "
+                "Use when the patient asks about a specific consultation or visit. "
+                "Call list_consultations first if the ID is unknown."
+            ),
+            parameters=genai_types.Schema(
+                type="OBJECT",
+                properties={
+                    "consultation_id": genai_types.Schema(
+                        type="STRING",
+                        description="The consultation ID to retrieve",
+                    ),
+                },
+                required=["consultation_id"],
+            ),
+        ),
     ]
 )
 
@@ -196,6 +226,10 @@ async def execute_tool(
             return await _tool_delete_reminder(uid, args, db)
         elif tool_name == "update_reminder":
             return await _tool_update_reminder(uid, args, db)
+        elif tool_name == "list_consultations":
+            return await _tool_list_consultations(uid, db)
+        elif tool_name == "get_consultation":
+            return await _tool_get_consultation(uid, args, db)
         else:
             return f"Unknown tool: {tool_name}"
     except Exception as e:
@@ -388,6 +422,70 @@ async def _tool_update_reminder(uid: str, args: dict, db: firestore.AsyncClient)
     return f"Reminder '{reminder.title}' updated. Status: {reminder.status.value}."
 
 
+async def _tool_list_consultations(uid: str, db: firestore.AsyncClient) -> str:
+    from patient_service.consultations.consultations_func import get_audio_consultations
+    consultations = await get_audio_consultations(uid, db)
+    if not consultations:
+        return "No consultation recordings found."
+    lines = ["Here are your consultation recordings:\n"]
+    for c in consultations:
+        date = c.created_at.astimezone(IST).strftime("%d %b %Y") if c.created_at else "Unknown date"
+        title = c.title or "Untitled"
+        status = c.status.value if hasattr(c.status, "value") else str(c.status)
+        doctor = f" | Dr: {c.doctor_name}" if c.doctor_name else ""
+        lines.append(f"• [{c.id}] {title} — {status} | {date}{doctor}")
+        if c.key_diagnoses:
+            lines.append(f"  Diagnoses: {', '.join(c.key_diagnoses)}")
+        if c.icd_codes:
+            icd_strs = [f"{i.code} ({i.description})" for i in c.icd_codes]
+            lines.append(f"  ICD codes: {', '.join(icd_strs)}")
+        if c.summary:
+            # Truncate summary to keep chatbot response concise
+            summary_preview = c.summary[:120].rstrip()
+            if len(c.summary) > 120:
+                summary_preview += "..."
+            lines.append(f"  Summary: {summary_preview}")
+    return "\n".join(lines)
+
+
+async def _tool_get_consultation(uid: str, args: dict, db: firestore.AsyncClient) -> str:
+    from patient_service.consultations.consultations_func import get_audio_consultation
+    consultation_id = args.get("consultation_id", "")
+    if not consultation_id:
+        return "No consultation ID provided. Please call list_consultations first."
+    try:
+        c = await get_audio_consultation(uid, consultation_id, db)
+    except (ValueError, PermissionError) as e:
+        return str(e)
+
+    date = c.created_at.astimezone(IST).strftime("%d %b %Y") if c.created_at else "Unknown date"
+    lines = [
+        f"Consultation: {c.title or 'Untitled'} ({date})",
+        f"Status: {c.status.value} | Language: {c.language.value if hasattr(c.language, 'value') else c.language}",
+    ]
+    if c.doctor_name:
+        lines.append(f"Doctor: {c.doctor_name}")
+    if c.summary:
+        lines.append(f"\nSummary:\n{c.summary}")
+    if c.key_diagnoses:
+        lines.append(f"\nDiagnoses: {', '.join(c.key_diagnoses)}")
+    if c.icd_codes:
+        icd_strs = [f"{i.code} — {i.description}" for i in c.icd_codes]
+        lines.append(f"ICD codes: {'; '.join(icd_strs)}")
+    if c.medicines:
+        lines.append("\nMedicines prescribed:")
+        for m in c.medicines:
+            parts = [m.name]
+            if m.dosage:      parts.append(m.dosage)
+            if m.frequency:   parts.append(m.frequency)
+            if m.instructions: parts.append(m.instructions)
+            if m.duration:    parts.append(f"for {m.duration}")
+            lines.append(f"  • {' | '.join(parts)}")
+    if c.reminder_suggestions:
+        lines.append(f"\nReminder suggestions: {len(c.reminder_suggestions)} created")
+    return "\n".join(lines)
+
+
 # ══════════════════════════════════════════════════════════════
 #  Gemini function-calling entry point
 # ══════════════════════════════════════════════════════════════
@@ -426,7 +524,9 @@ async def try_tool_call(
         "  - type: 'medicine' for medication reminders, 'follow_up' for doctor/appointment reminders.\n"
         "  - For follow_up: capture appointment_date and appointment_time if mentioned.\n"
         "• Patient wants to delete/cancel a reminder → delete_reminder (call list_reminders first if ID unknown)\n"
-        "• Patient wants to pause/resume/modify a reminder → update_reminder\n\n"
+        "• Patient wants to pause/resume/modify a reminder → update_reminder\n"
+        "• Patient wants to list/show consultations, doctor visits, or recordings → list_consultations\n"
+        "• Patient wants details of a specific consultation → get_consultation (call list_consultations first if ID unknown)\n\n"
         "━━ WAY 2: ASK ONE CLARIFYING QUESTION ━━\n"
         "If the patient wants to create a reminder but a required detail is missing, ask exactly ONE question:\n"
         "  Missing title/purpose? → Ask: 'What is this reminder for? (e.g. medicine name or appointment)'\n"

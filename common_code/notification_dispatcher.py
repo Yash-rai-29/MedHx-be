@@ -2,7 +2,9 @@ import logging
 import datetime
 import json
 import os
-from common_code.firestore import get_db, send_push_notification, log_audit_event
+from firebase_admin import messaging
+from google.cloud import firestore as _firestore
+from common_code.firestore import get_db, log_audit_event
 from common_code.config import settings
 
 logger = logging.getLogger(__name__)
@@ -58,12 +60,13 @@ async def dispatch_notification(
     # Resolve FCM token: prefer platform-keyed map, fall back to legacy flat key
     # fcm_tokens map: { "ios": "...", "android": "...", "web": "..." }
     fcm_tokens_map: dict = user_data.get("fcm_tokens") or {}
-    # Pick the first available token across all platforms (most-recently registered wins)
     platform_order = ["android", "ios", "web"]
     fcm_token = None
+    active_platform: str | None = None
     for platform in platform_order:
         if fcm_tokens_map.get(platform):
             fcm_token = fcm_tokens_map[platform]
+            active_platform = platform
             break
     # Final fallback: legacy single flat key written by older clients
     if not fcm_token:
@@ -206,25 +209,20 @@ async def dispatch_notification(
         })
         if resolved_deeplink:
             payload["deeplink"] = resolved_deeplink
-            
+
         logger.info(f"Sending push notification to user {patient_id} of type {notification_type}...")
-        msg_id = send_push_notification(
-            token=fcm_token,
-            title=resolved_title,
-            body=resolved_body,
-            data=payload
-        )
-        
-        if msg_id:
+        try:
+            fcm_message = messaging.Message(
+                notification=messaging.Notification(title=resolved_title, body=resolved_body),
+                data=payload,
+                token=fcm_token,
+            )
+            msg_id = messaging.send(fcm_message)
             push_status = "sent"
             try:
-                await notif_ref.update({
-                    "pushStatus": "sent",
-                    "pushMessageId": msg_id
-                })
+                await notif_ref.update({"pushStatus": "sent", "pushMessageId": msg_id})
             except Exception as e:
                 logger.warning(f"Failed to update push status on notification {notification_id}: {e}")
-                
             await log_audit_event(
                 actor="system",
                 action="SEND_PUSH_NOTIFICATION",
@@ -233,18 +231,31 @@ async def dispatch_notification(
                     "title": resolved_title,
                     "type": notification_type,
                     "message_id": msg_id,
-                    "notification_id": notification_id
-                }
+                    "notification_id": notification_id,
+                },
             )
-        else:
+        except messaging.UnregisteredError:
+            # Token is stale (device changed or app uninstalled) — prune it so it is not retried
+            logger.warning(f"FCM token unregistered for {patient_id}/{active_platform}, pruning")
+            if active_platform:
+                try:
+                    await db.collection(settings.USERS_COLLECTION).document(patient_id).update({
+                        f"fcm_tokens.{active_platform}": _firestore.DELETE_FIELD
+                    })
+                except Exception as prune_err:
+                    logger.warning(f"Failed to prune stale FCM token: {prune_err}")
+            push_status = "failed_token_invalid"
+            try:
+                await notif_ref.update({"pushStatus": push_status})
+            except Exception:
+                pass
+        except Exception as e:
+            logger.warning(f"FCM send failed for {patient_id}: {e}")
             push_status = "failed"
             try:
-                await notif_ref.update({
-                    "pushStatus": "failed"
-                })
-            except Exception as e:
-                logger.warning(f"Failed to update failed push status on notification {notification_id}: {e}")
-            logger.warning(f"Notification dispatcher failed to send FCM message for user {patient_id}.")
+                await notif_ref.update({"pushStatus": "failed"})
+            except Exception:
+                pass
     else:
         logger.info(f"FCM push skipped for user {patient_id} due to status: {push_status}")
 

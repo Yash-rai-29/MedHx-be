@@ -1,4 +1,5 @@
 import datetime
+from datetime import UTC
 from google.cloud import firestore
 from common_code.config import settings
 from patient_service.profile.profile_model import (
@@ -33,7 +34,7 @@ async def get_patient_profile(uid: str, db: firestore.AsyncClient) -> PatientPro
     
     # Map emergency contact
     ec_dict = patient_data.get("emergency_contact")
-    emergency_contact = EmergencyContact(**ec_dict) if ec_dict else None
+    emergency_contact = EmergencyContact(**ec_dict) if isinstance(ec_dict, dict) else None
     
     # Fetch DOB and location from patient details (with fallback to user_data)
     dob = patient_data.get("date_of_birth") or user_data.get("date_of_birth")
@@ -159,7 +160,7 @@ async def log_patient_vitals(uid: str, height: float, weight: float, db: firesto
     height_meters = height / 100.0
     bmi = round(weight / (height_meters ** 2), 2)
     category = compute_indian_bmi_category(bmi)
-    recorded_at = datetime.datetime.utcnow()
+    recorded_at = datetime.datetime.now(UTC)
     
     vitals_data = {
         "patientId": uid,
@@ -188,12 +189,13 @@ async def log_patient_vitals(uid: str, height: float, weight: float, db: firesto
         recorded_at=recorded_at
     )
 
-async def get_patient_vitals_history(uid: str, db: firestore.AsyncClient) -> list[VitalsLogResponse]:
+async def get_patient_vitals_history(uid: str, db: firestore.AsyncClient, limit: int = 90) -> list[VitalsLogResponse]:
     """Retrieves weight/BMI vitals history. Skips entries that lack height/weight (extended vitals docs)."""
     docs = await (
         db.collection(settings.VITALS_COLLECTION)
         .where("patientId", "==", uid)
         .order_by("recordedAt", direction=firestore.Query.DESCENDING)
+        .limit(limit)
         .get()
     )
     history = []

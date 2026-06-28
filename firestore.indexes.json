@@ -83,6 +83,24 @@
       ]
     },
     {
+      "collectionGroup": "audio_consultations",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "patientId",  "order": "ASCENDING" },
+        { "fieldPath": "status",     "order": "ASCENDING" },
+        { "fieldPath": "created_at", "order": "DESCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "vitals",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "patientId",   "order": "ASCENDING" },
+        { "fieldPath": "vital_types", "arrayConfig": "CONTAINS" },
+        { "fieldPath": "measured_at", "order": "DESCENDING" }
+      ]
+    },
+    {
       "collectionGroup": "document_chunks",
       "queryScope": "COLLECTION",
       "fields": [
