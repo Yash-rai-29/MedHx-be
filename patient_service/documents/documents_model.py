@@ -35,7 +35,7 @@ class SupportedLanguage(str, Enum):
 LANGUAGE_DISPLAY_NAMES: dict[str, str] = {
     "en": "English",
     "hi": "Hindi",
-    "ta": "Tamil",
+    "ta": "Tamil", 
     "te": "Telugu",
     "bn": "Bengali",
     "mr": "Marathi",
@@ -122,6 +122,26 @@ class DocumentResponse(BaseModel):
         description="Actionable next steps and care instructions for the patient",
         examples=[["Take Metformin 500mg twice daily with meals", "Avoid sugar and refined carbohydrates", "Follow up with endocrinologist in 4 weeks"]]
     )
+    warnings:           List[str]                = Field(
+        default=[],
+        description="Processing warnings for this document (e.g. patient name mismatch, unsupported format).",
+    )
+
+
+class DocumentListItem(BaseModel):
+    """Lightweight model for list endpoints — excludes raw_text, full clinical arrays, and summaries."""
+    id:             str
+    file_path:      str
+    status:         DocumentStatus
+    type:           DocumentType
+    title:          Optional[str]     = None
+    description:    Optional[str]     = None
+    language:       SupportedLanguage = SupportedLanguage.english
+    doctor_name:    Optional[str]     = None
+    document_date:  Optional[str]     = None
+    consultation_id: Optional[str]   = None
+    warnings:       List[str]         = Field(default=[])
+    created_at:     datetime
 
 
 class TranslateSummaryRequest(BaseModel):

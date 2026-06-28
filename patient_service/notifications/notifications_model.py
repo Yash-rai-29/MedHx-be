@@ -7,12 +7,13 @@ from enum import Enum
 # ── Enums ──────────────────────────────────────────────────────────────────────
 
 class NotificationType(str, Enum):
-    medicine     = "medicine"
-    consultation = "consultation"
-    report       = "report"
-    vitals       = "vitals"
-    chat         = "chat"
-    general      = "general"
+    medicine            = "medicine"
+    consultation        = "consultation"
+    audio_consultation  = "audio_consultation"
+    report              = "report"
+    vitals              = "vitals"
+    chat                = "chat"
+    general             = "general"
 
 class PushStatus(str, Enum):
     pending          = "pending"

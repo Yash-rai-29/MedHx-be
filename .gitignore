@@ -181,3 +181,6 @@ docs/_build/
 scripts/*
 !scripts/generate_legal_docs.py
 
+last_bearer_token.txt
+last_bearer_token.txt
+harsh_discharge_summary.pdf

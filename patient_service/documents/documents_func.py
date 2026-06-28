@@ -9,6 +9,7 @@ from common_code.config import settings
 from common_code.gcp_clients import (
     upload_bytes_to_gcs,
     async_upload_bytes_to_gcs,
+    async_download_bytes_from_gcs,
     parse_medical_document,
     generate_gemini_content,
     async_generate_gemini_content,
@@ -18,6 +19,7 @@ from common_code.gcp_clients import (
     synthesize_speech
 )
 from patient_service.documents.documents_model import (
+    DocumentListItem,
     DocumentResponse,
     DocumentStatus,
     DocumentType,
@@ -151,6 +153,26 @@ def _coerce_abnormal_labs(raw: list) -> list[dict]:
         except Exception:
             result.append({"parameter_name": str(parameter_name), "value": str(value)})
     return result
+
+
+def _names_match(extracted: str, profile: str) -> bool:
+    """Returns True when extracted and profile names refer to the same person.
+
+    Uses a word-overlap heuristic: if any word from the extracted name (≥3 chars)
+    is found in the profile name (case-insensitive), they are considered a match.
+    This handles common variations like "Harsh Kumar" vs "Harsh" or "Mr. Harsh Kumar".
+    """
+    a = extracted.strip().lower()
+    b = profile.strip().lower()
+    if a == b:
+        return True
+    # Check substring containment in either direction
+    if a in b or b in a:
+        return True
+    # Word-level overlap: any meaningful word from extracted appears in profile
+    a_words = {w for w in a.split() if len(w) >= 3}
+    b_words = {w for w in b.split() if len(w) >= 3}
+    return bool(a_words & b_words)
 
 
 def _infer_doc_type_from_text(raw_text: str) -> DocumentType:
@@ -339,6 +361,7 @@ async def background_parse_and_index_document(
             "       'status' (exactly one of: 'High', 'Low', 'Critical').\n"
             "   - red_flags: Warning symptoms in this document that require immediate emergency care (empty list if none).\n"
             "   - actionable_steps: Next steps, lifestyle changes, dietary restrictions, follow-up timelines.\n"
+            "   - patient_name: Full name of the patient as written on the document (null if not found).\n"
             f"{title_instruction}"
             f"{summary_lang_instruction}\n"
             "Return ONLY a valid JSON object with these exact keys (no markdown, no explanation):\n"
@@ -348,6 +371,7 @@ async def background_parse_and_index_document(
             + "  \"summary\": \"<empathetic plain-English summary>\",\n"
             "  \"doctor_name\": \"<string or null>\",\n"
             "  \"document_date\": \"<YYYY-MM-DD or null>\",\n"
+            "  \"patient_name\": \"<string or null>\",\n"
             "  \"medications\": [{\"name\": \"...\", \"dosage\": \"...\", \"frequency\": \"...\", \"instructions\": \"...\"}],\n"
             "  \"abnormal_labs\": [{\"parameter_name\": \"...\", \"value\": \"...\", \"reference_range\": \"...\", \"status\": \"...\"}],\n"
             "  \"red_flags\": [\"...\"],\n"
@@ -365,6 +389,7 @@ async def background_parse_and_index_document(
         generated_title = None
         doctor_name = None
         document_date = None
+        extracted_patient_name: str | None = None
         medications: list[dict] = []
         abnormal_labs: list[dict] = []
         red_flags: list[str] = []
@@ -379,18 +404,34 @@ async def background_parse_and_index_document(
                 logger.warning(f"[doc:{doc_id}] Unknown Gemini category '{raw_category}', falling back to 'other'")
                 doc_type = DocumentType.other
 
-            summary          = parsed.get("summary", "")
-            generated_title  = parsed.get("title") or None
-            doctor_name      = parsed.get("doctor_name") or None
-            document_date    = parsed.get("document_date") or None
-            medications      = _coerce_medications(parsed.get("medications", []))
-            abnormal_labs    = _coerce_abnormal_labs(parsed.get("abnormal_labs", []))
-            red_flags        = [s for s in parsed.get("red_flags", []) if isinstance(s, str)]
-            actionable_steps = [s for s in parsed.get("actionable_steps", []) if isinstance(s, str)]
+            summary                = parsed.get("summary", "")
+            generated_title        = parsed.get("title") or None
+            doctor_name            = parsed.get("doctor_name") or None
+            document_date          = parsed.get("document_date") or None
+            extracted_patient_name = parsed.get("patient_name") or None
+            medications            = _coerce_medications(parsed.get("medications", []))
+            abnormal_labs          = _coerce_abnormal_labs(parsed.get("abnormal_labs", []))
+            red_flags              = [s for s in parsed.get("red_flags", []) if isinstance(s, str)]
+            actionable_steps       = [s for s in parsed.get("actionable_steps", []) if isinstance(s, str)]
         except (json.JSONDecodeError, Exception) as je:
             logger.warning(f"[doc:{doc_id}] Failed to parse Gemini JSON: {je}. Raw output: {gemini_output[:200]}")
             summary  = gemini_output
             doc_type = _infer_doc_type_from_text(raw_text)
+
+        # 3a. Collect processing warnings
+        doc_warnings: list[str] = []
+        if extracted_patient_name:
+            try:
+                profile_snap = await db.collection(settings.PATIENTS_COLLECTION).document(uid).get()
+                profile_name: str | None = profile_snap.to_dict().get("name") if profile_snap.exists else None
+                if profile_name and not _names_match(extracted_patient_name, profile_name):
+                    doc_warnings.append(
+                        f"The name on this document ('{extracted_patient_name}') does not match your profile name "
+                        f"('{profile_name}'). Please verify that you have uploaded the correct document."
+                    )
+                    logger.info(f"[doc:{doc_id}] Name mismatch: doc='{extracted_patient_name}', profile='{profile_name}'")
+            except Exception as nme:
+                logger.warning(f"[doc:{doc_id}] Could not check patient name: {nme}")
 
         # 3. Generate document-level embedding (for backward-compat fallback) and
         #    chunk-level embeddings (for Firestore Vector Search).
@@ -413,18 +454,19 @@ async def background_parse_and_index_document(
         # 4. Persist enriched data to Firestore
         final_title = title or generated_title
         update_payload: dict = {
-            "status":           DocumentStatus.completed.value,
-            "type":             doc_type.value,
-            "language":         effective_lang.value,
-            "raw_text":         raw_text,
-            "summary":          summary,
-            "embedding":        vector,
-            "doctor_name":      doctor_name,
-            "document_date":    document_date,
-            "medications":      medications,
-            "abnormal_labs":    abnormal_labs,
-            "red_flags":        red_flags,
+            "status":                DocumentStatus.completed.value,
+            "type":                  doc_type.value,
+            "language":              effective_lang.value,
+            "raw_text":              raw_text,
+            "summary":               summary,
+            "embedding":             vector,
+            "doctor_name":           doctor_name,
+            "document_date":         document_date,
+            "medications":           medications,
+            "abnormal_labs":         abnormal_labs,
+            "red_flags":             red_flags,
             "actionable_steps": actionable_steps,
+            "warnings":         doc_warnings,
             "processedAt":      datetime.datetime.now(datetime.UTC),
         }
         if final_title is not None:
@@ -495,40 +537,88 @@ async def delete_document(uid: str, doc_id: str, db: firestore.AsyncClient) -> N
     logger.info(f"[doc:{doc_id}] Firestore record deleted by uid={uid}")
 
 
-async def get_patient_documents(uid: str, db: firestore.AsyncClient) -> list[DocumentResponse]:
-    """Retrieves patient medical history documents."""
-    docs = await db.collection(settings.DOCUMENTS_COLLECTION) \
-        .where("patientId", "==", uid) \
-        .order_by("createdAt", direction=firestore.Query.DESCENDING) \
+def _doc_to_response(doc_id: str, d: dict) -> DocumentResponse:
+    return DocumentResponse(
+        id=doc_id,
+        file_path=d.get("fileRef", ""),
+        status=d.get("status", DocumentStatus.completed.value),
+        type=d.get("type", DocumentType.other.value),
+        raw_text=d.get("raw_text", ""),
+        summary=d.get("summary", ""),
+        translated_summary=d.get("translated_summary"),
+        created_at=d.get("createdAt"),
+        title=d.get("title"),
+        description=d.get("description"),
+        language=d.get("language", SupportedLanguage.english.value),
+        consultation_id=d.get("consultation_id"),
+        doctor_name=d.get("doctor_name"),
+        document_date=d.get("document_date"),
+        medications=d.get("medications", []),
+        abnormal_labs=d.get("abnormal_labs", []),
+        red_flags=d.get("red_flags", []),
+        actionable_steps=d.get("actionable_steps", []),
+        warnings=d.get("warnings") or [],
+    )
+
+
+_DOC_LIST_FIELDS = [
+    "patientId", "fileRef", "status", "type", "title", "description",
+    "language", "doctor_name", "document_date", "consultation_id",
+    "warnings", "createdAt",
+]
+
+
+def _doc_to_list_item(doc_id: str, d: dict) -> DocumentListItem:
+    raw_lang = d.get("language", "en")
+    try:
+        language = SupportedLanguage(raw_lang)
+    except ValueError:
+        language = SupportedLanguage.english
+
+    return DocumentListItem(
+        id=doc_id,
+        file_path=d.get("fileRef", ""),
+        status=d.get("status", DocumentStatus.completed.value),
+        type=d.get("type", DocumentType.other.value),
+        title=d.get("title"),
+        description=d.get("description"),
+        language=language,
+        doctor_name=d.get("doctor_name"),
+        document_date=d.get("document_date"),
+        consultation_id=d.get("consultation_id"),
+        warnings=d.get("warnings") or [],
+        created_at=d.get("createdAt"),
+    )
+
+
+async def get_patient_documents(uid: str, db: firestore.AsyncClient) -> list[DocumentListItem]:
+    """Retrieves patient medical history documents — lightweight card data only."""
+    docs = await (
+        db.collection(settings.DOCUMENTS_COLLECTION)
+        .where("patientId", "==", uid)
+        .order_by("createdAt", direction=firestore.Query.DESCENDING)
+        .select(_DOC_LIST_FIELDS)
         .get()
-        
+    )
+
     results = []
     for doc in docs:
         try:
-            d = doc.to_dict()
-            results.append(DocumentResponse(
-                id=doc.id,
-                file_path=d.get("fileRef", ""),
-                status=d.get("status", DocumentStatus.completed.value),
-                type=d.get("type", DocumentType.other.value),
-                raw_text=d.get("raw_text", ""),
-                summary=d.get("summary", ""),
-                translated_summary=d.get("translated_summary"),
-                created_at=d.get("createdAt"),
-                title=d.get("title"),
-                description=d.get("description"),
-                language=d.get("language", SupportedLanguage.english.value),
-                consultation_id=d.get("consultation_id"),
-                doctor_name=d.get("doctor_name"),
-                document_date=d.get("document_date"),
-                medications=d.get("medications", []),
-                abnormal_labs=d.get("abnormal_labs", []),
-                red_flags=d.get("red_flags", []),
-                actionable_steps=d.get("actionable_steps", [])
-            ))
+            results.append(_doc_to_list_item(doc.id, doc.to_dict()))
         except Exception as e:
             logger.warning(f"Skipping malformed document record {doc.id}: {e}")
     return results
+
+
+async def get_document(uid: str, doc_id: str, db: firestore.AsyncClient) -> DocumentResponse:
+    """Retrieves a single document by ID, enforcing patient ownership."""
+    snap = await db.collection(settings.DOCUMENTS_COLLECTION).document(doc_id).get()
+    if not snap.exists:
+        raise ValueError("Document not found.")
+    d = snap.to_dict()
+    if d.get("patientId") != uid:
+        raise PermissionError("Access to this document is unauthorized.")
+    return _doc_to_response(snap.id, d)
 
 async def translate_document_summary(
     uid: str,
@@ -615,5 +705,13 @@ async def synthesize_summary_speech(
                 "translated_summary": text_to_speak,
             })
 
-    return synthesize_speech(text_to_speak, voice_locale)
+    # Check GCS cache before calling ElevenLabs
+    cache_path = f"tts/documents/{doc_id}/{effective_lang}.mp3"
+    cached = await async_download_bytes_from_gcs(cache_path)
+    if cached:
+        return cached
+
+    audio = synthesize_speech(text_to_speak, voice_locale)
+    await async_upload_bytes_to_gcs(cache_path, audio, content_type="audio/mpeg")
+    return audio
 

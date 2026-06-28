@@ -18,6 +18,7 @@ from patient_service.reminders.reminders_model import (
     PubSubEnvelope,
     RecurrenceType,
     ReminderCreateRequest,
+    ReminderListItem,
     ReminderResponse,
     ReminderSchedule,
     ReminderStatus,
@@ -26,6 +27,7 @@ from patient_service.reminders.reminders_model import (
     TriggerPayload,
 )
 from patient_service.reminders.reminders_func import (
+    ReminderNotFoundError,
     batch_create_reminders,
     create_reminder,
     delete_reminder,
@@ -79,17 +81,31 @@ async def batch_create_endpoint(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.get("", response_model=List[ReminderResponse])
+@router.get("", response_model=List[ReminderListItem])
 async def list_reminders_endpoint(
-    status_filter: Optional[ReminderStatus] = Query(None, alias="status",
-                                                    description="Filter by status (active/paused/cancelled/expired)"),
-    type_filter:   Optional[ReminderType]   = Query(None, alias="type",
-                                                    description="Filter by type (medicine/follow_up)"),
+    status: Optional[str] = Query(None, description="Filter by status (active/paused/cancelled/expired)"),
+    type:   Optional[str] = Query(None, description="Filter by type (medicine/follow_up)"),
     current_user: dict = Depends(patient_gate),
     db: firestore.AsyncClient = Depends(get_db),
 ):
     """Lists all reminders for the authenticated patient, ordered by next_trigger_at."""
     uid = current_user["uid"]
+
+    # Treat empty string (sent by Flutter as ?status=&type=) the same as absent
+    status_filter: Optional[ReminderStatus] = None
+    if status:
+        try:
+            status_filter = ReminderStatus(status)
+        except ValueError:
+            raise HTTPException(status_code=422, detail=f"Invalid status value: '{status}'")
+
+    type_filter: Optional[ReminderType] = None
+    if type:
+        try:
+            type_filter = ReminderType(type)
+        except ValueError:
+            raise HTTPException(status_code=422, detail=f"Invalid type value: '{type}'")
+
     try:
         return await get_reminders(uid, db, status=status_filter, reminder_type=type_filter)
     except Exception as e:
@@ -108,7 +124,7 @@ async def get_reminder_endpoint(
         return await get_reminder(uid, reminder_id, db)
     except PermissionError as e:
         raise HTTPException(status_code=403, detail=str(e))
-    except ValueError as e:
+    except ReminderNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -124,6 +140,7 @@ async def update_reminder_endpoint(
     """
     Updates a reminder. Pass `status: paused` to pause, `status: active` to resume.
     Resuming recomputes next_trigger_at from now and restarts the Cloud Task chain.
+    Old Cloud Tasks are cancelled before the new one is created to prevent 409 conflicts.
     """
     uid = current_user["uid"]
     try:
@@ -133,8 +150,11 @@ async def update_reminder_endpoint(
         return reminder
     except PermissionError as e:
         raise HTTPException(status_code=403, detail=str(e))
-    except ValueError as e:
+    except ReminderNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))
+    except ValueError as e:
+        # Schedule validation failure — not a "not found", tell the client the schedule is invalid
+        raise HTTPException(status_code=422, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -145,10 +165,7 @@ async def delete_reminder_endpoint(
     current_user: dict = Depends(patient_gate),
     db: firestore.AsyncClient = Depends(get_db),
 ):
-    """
-    Marks the reminder as cancelled. The next Cloud Task that fires will see the
-    status and stop the chain — no Cloud Task cancellation API call needed.
-    """
+    """Marks the reminder as cancelled and cancels its pending Cloud Task."""
     uid = current_user["uid"]
     try:
         await delete_reminder(uid, reminder_id, db)
@@ -156,7 +173,7 @@ async def delete_reminder_endpoint(
         return DeleteReminderResponse(id=reminder_id, message="Reminder cancelled successfully.")
     except PermissionError as e:
         raise HTTPException(status_code=403, detail=str(e))
-    except ValueError as e:
+    except ReminderNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

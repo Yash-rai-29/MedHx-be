@@ -5,6 +5,7 @@ from typing import List, Optional
 from common_code.firestore import get_db, log_audit_event
 from common_code.firebase_auth import require_role
 from patient_service.documents.documents_model import (
+    DocumentListItem,
     DocumentResponse,
     DeleteDocumentResponse,
     SupportedLanguage,
@@ -13,6 +14,7 @@ from patient_service.documents.documents_model import (
 )
 from patient_service.documents.documents_func import (
     get_patient_documents,
+    get_document,
     delete_document,
     translate_document_summary,
     synthesize_summary_speech,
@@ -63,7 +65,7 @@ async def upload_document(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.get("", response_model=List[DocumentResponse])
+@router.get("", response_model=List[DocumentListItem])
 async def get_documents(
     current_user: dict = Depends(patient_gate),
     db: firestore.AsyncClient = Depends(get_db)
@@ -71,6 +73,23 @@ async def get_documents(
     """Retrieves all medical history documents for the authenticated patient."""
     uid = current_user.get("uid")
     return await get_patient_documents(uid, db)
+
+
+@router.get("/{doc_id}", response_model=DocumentResponse)
+async def get_document_by_id(
+    doc_id: str,
+    current_user: dict = Depends(patient_gate),
+    db: firestore.AsyncClient = Depends(get_db),
+):
+    """Gets a single document by ID."""
+    try:
+        return await get_document(current_user["uid"], doc_id, db)
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.post("/{doc_id}/translate", response_model=TranslateSummaryResponse)

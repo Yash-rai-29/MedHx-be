@@ -38,6 +38,8 @@ GEMINI_EMBEDDING_MODEL=gemini-embedding-001,\
 GEMINI_LOCATION=us-central1,\
 ELEVENLABS_VOICE_ID=zEvjs17jNQ2fH5FxAat2,\
 ELEVENLABS_TTS_MODEL_ID=eleven_turbo_v2_5,\
-ELEVENLABS_STT_MODEL_ID=scribe_v2"
+ELEVENLABS_STT_MODEL_ID=scribe_v2,\
+DOCUMENT_AI_PROCESSOR_NAME=projects/302860899707/locations/us/processors/8ee2909bd421f8a4,\
+SERVICE_URL=https://patient-service-302860899707.asia-south1.run.app"
 
 echo "Deployment complete for $SERVICE_NAME!"

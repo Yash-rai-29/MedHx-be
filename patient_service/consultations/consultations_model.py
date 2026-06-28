@@ -4,6 +4,7 @@ from datetime import datetime
 from enum import Enum
 
 from patient_service.documents.documents_model import SupportedLanguage
+from patient_service.reminders.reminders_model import ReminderCreateRequest
 
 
 # ══════════════════════════════════════════════════════════════
@@ -53,8 +54,11 @@ class AudioConsultationStatus(str, Enum):
 
 
 class DiarizedSegment(BaseModel):
-    speaker: str = Field(..., description="Speaker label (e.g. Doctor, Patient, Speaker 1)")
-    text:    str = Field(..., description="Spoken text for this segment")
+    speaker_id:  Optional[str]   = Field(None, description="Raw speaker ID from diarization (e.g. speaker_0)")
+    role:        Optional[str]   = Field(None, description="Inferred speaker role: Doctor, Patient, or Unknown")
+    text:        str             = Field(...,  description="Spoken text for this segment")
+    start_time:  Optional[float] = Field(None, description="Segment start time in seconds")
+    end_time:    Optional[float] = Field(None, description="Segment end time in seconds")
 
 
 class ExtractedMedicine(BaseModel):
@@ -65,25 +69,15 @@ class ExtractedMedicine(BaseModel):
     duration:     Optional[str] = Field(None, description="Duration to take (e.g. 7 days, ongoing)")
 
 
-class FollowUpSuggestion(BaseModel):
-    specialty:             Optional[str] = Field(None, description="Medical specialty (e.g. cardiology)")
-    reason:                Optional[str] = Field(None, description="Why follow-up is needed")
-    suggested_within_days: Optional[int] = Field(None, description="Timeframe in days")
+# ReminderSuggestion is the same model as ReminderCreateRequest so the frontend
+# can pass a suggestion directly to POST /reminders without any transformation.
+# Re-exported here for clarity in AudioConsultationResponse.
+ReminderSuggestion = ReminderCreateRequest
 
 
-class SuggestedReminderSchedule(BaseModel):
-    recurrence:   Optional[str]          = Field(None, description="once / daily / weekly / monthly")
-    time_of_day:  Optional[str]          = Field("09:00", description="HH:MM (24h UTC)")
-    days_of_week: Optional[List[int]]    = Field(None, description="0=Mon..6=Sun for weekly")
-
-
-class ReminderSuggestion(BaseModel):
-    title:              str                              = Field(..., description="Reminder title")
-    type:               str                              = Field(..., description="medicine or follow_up")
-    notes:              Optional[str]                    = None
-    medicine_details:   Optional[ExtractedMedicine]      = None
-    follow_up_details:  Optional[FollowUpSuggestion]     = None
-    suggested_schedule: Optional[SuggestedReminderSchedule] = None
+class AttachedDocument(BaseModel):
+    id:    str
+    title: Optional[str] = None
 
 
 class AudioConsultationUploadResponse(BaseModel):
@@ -93,22 +87,36 @@ class AudioConsultationUploadResponse(BaseModel):
     created_at: datetime
 
 
+class AudioConsultationListItem(BaseModel):
+    """Lightweight model for list endpoints — no heavy transcript/segment/medicine data."""
+    id:             str
+    status:         AudioConsultationStatus
+    file_path:      str
+    title:          Optional[str]           = None
+    language:       SupportedLanguage       = SupportedLanguage.english
+    summary:        Optional[str]           = None
+    doctor_name:    Optional[str]           = None
+    key_diagnoses:  Optional[List[str]]     = None
+    error_message:  Optional[str]           = None
+    created_at:     datetime
+
+
 class AudioConsultationResponse(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
     id:                    str
     status:                AudioConsultationStatus
     file_path:             str
+    title:                 Optional[str]                  = None
     language:              SupportedLanguage              = SupportedLanguage.english
     transcript:            Optional[str]                  = None
     segments:              Optional[List[DiarizedSegment]]     = None
     medicines:             Optional[List[ExtractedMedicine]]   = None
-    follow_ups:            Optional[List[FollowUpSuggestion]]  = None
     reminder_suggestions:  Optional[List[ReminderSuggestion]]  = None
     key_diagnoses:         Optional[List[str]]            = None
     summary:               Optional[str]                  = None
     doctor_name:           Optional[str]                  = None
-    attached_document_ids: Optional[List[str]]            = None
+    attached_documents:    Optional[List[AttachedDocument]] = None
     error_message:         Optional[str]                  = None
     created_at:            datetime
 

@@ -15,7 +15,6 @@ import google.auth
 from google.auth import impersonated_credentials
 from google.cloud import storage
 import httpx
-from google.cloud import speech_v2
 from google.cloud import documentai
 from google.cloud import translate_v2 as translate
 from google.cloud import texttospeech
@@ -149,18 +148,114 @@ async def async_upload_bytes_to_gcs(blob_name: str, data: bytes, content_type: s
     return await asyncio.to_thread(upload_bytes_to_gcs, blob_name, data, content_type)
 
 
+def download_bytes_from_gcs(blob_name: str) -> bytes | None:
+    """Downloads a blob from GCS. Returns None if the blob does not exist."""
+    try:
+        blob = _get_storage().bucket(settings.STORAGE_BUCKET_NAME).blob(blob_name)
+        if not blob.exists():
+            return None
+        return blob.download_as_bytes()
+    except Exception as e:
+        logger.warning(f"GCS download error for {blob_name}: {e}")
+        return None
+
+
+async def async_download_bytes_from_gcs(blob_name: str) -> bytes | None:
+    """Non-blocking GCS download — returns None on miss or error."""
+    return await asyncio.to_thread(download_bytes_from_gcs, blob_name)
+
+
+def delete_gcs_prefix(prefix: str) -> None:
+    """Deletes all blobs under a GCS prefix. Used to invalidate TTS cache."""
+    try:
+        bucket = _get_storage().bucket(settings.STORAGE_BUCKET_NAME)
+        blobs = list(bucket.list_blobs(prefix=prefix))
+        for blob in blobs:
+            blob.delete()
+        if blobs:
+            logger.info(f"Deleted {len(blobs)} GCS blob(s) under prefix: {prefix}")
+    except Exception as e:
+        logger.warning(f"GCS prefix delete error ({prefix}): {e}")
+
+
+async def async_delete_gcs_prefix(prefix: str) -> None:
+    """Non-blocking version of delete_gcs_prefix."""
+    await asyncio.to_thread(delete_gcs_prefix, prefix)
+
+
 # ══════════════════════════════════════════════════════════════
 #  2. Speech-to-Text v2 (Chirp)
 # ══════════════════════════════════════════════════════════════
+
+def _parse_diarized_segments(words: list[dict]) -> list[dict]:
+    """Convert ElevenLabs word-level diarization output into speaker segments.
+
+    Groups consecutive words that share the same speaker_id into one segment.
+    Spacing/punctuation tokens (type != 'word') are appended to the current
+    segment without triggering a speaker change.
+
+    Returns a list of dicts:
+        {"speaker_id": "speaker_0", "text": "...", "start_time": 0.0, "end_time": 1.2}
+    """
+    if not words:
+        return []
+
+    segments: list[dict] = []
+    current_speaker: str | None = None
+    current_words:   list[str]  = []
+    current_start:   float      = 0.0
+    last_end:        float      = 0.0
+
+    for w in words:
+        w_type    = w.get("type", "word")
+        w_text    = w.get("text", "")
+        w_speaker = w.get("speaker_id")
+        w_start   = w.get("start") or 0.0
+        w_end     = w.get("end")   or w_start
+
+        # Non-word tokens (spacing, punctuation) — append to current segment
+        if w_type != "word":
+            if current_words:
+                current_words.append(w_text)
+            last_end = w_end
+            continue
+
+        # Speaker changed → flush current segment
+        if w_speaker != current_speaker and current_words:
+            segments.append({
+                "speaker_id": current_speaker,
+                "text":       " ".join(current_words).strip(),
+                "start_time": current_start,
+                "end_time":   w_start,
+            })
+            current_words = []
+
+        if not current_words:
+            current_speaker = w_speaker
+            current_start   = w_start
+
+        current_words.append(w_text)
+        last_end = w_end
+
+    # Flush final segment
+    if current_words:
+        segments.append({
+            "speaker_id": current_speaker,
+            "text":       " ".join(current_words).strip(),
+            "start_time": current_start,
+            "end_time":   last_end,
+        })
+
+    return segments
+
+
 async def transcribe_audio_bytes(
     audio_bytes: bytes,
     filename: str = "audio.wav",
-    language_code: str = "en-IN",
 ) -> dict[str, Any]:
     """
-    Transcribe raw audio bytes — no GCS round-trip needed.
-    Primary: ElevenLabs Scribe v2 (fastest).
-    Fallback: GCP STT v2 Chirp (via inline_data).
+    Transcribe raw audio bytes via ElevenLabs Scribe v2 with speaker diarization.
+    Returns {"full_text": str, "segments": list} on success, or empty values on failure.
     Returns {"full_text": str, "segments": list}.
     """
     # ── Primary: ElevenLabs ──────────────────────────────────────
@@ -181,52 +276,28 @@ async def transcribe_audio_bytes(
                     "https://api.elevenlabs.io/v1/speech-to-text",
                     headers={"xi-api-key": settings.ELEVENLABS_API_KEY},
                     files={"file": (filename, audio_bytes, mime_type)},
-                    data={"model_id": settings.ELEVENLABS_STT_MODEL_ID},
-                    timeout=60.0,
+                    data={
+                        "model_id":               settings.ELEVENLABS_STT_MODEL_ID,
+                        "diarize":                "true",
+                        "diarization_threshold":  "0.3",
+                    },
+                    timeout=120.0,
                 )
 
             if response.status_code == 200:
-                result = response.json()
-                text = result.get("text", "").strip()
-                return {
-                    "full_text": text,
-                    "segments": [{"speaker": "Patient", "text": text}],
-                }
+                result   = response.json()
+                full_text = result.get("text", "").strip()
+                segments  = _parse_diarized_segments(result.get("words", []))
+                return {"full_text": full_text, "segments": segments}
             else:
-                logger.warning(
-                    f"ElevenLabs STT failed {response.status_code}: {response.text[:200]}, "
-                    "falling back to GCP STT"
-                )
+                logger.warning(f"ElevenLabs STT failed {response.status_code}: {response.text[:200]}")
         except Exception as e:
-            logger.warning(f"ElevenLabs STT error: {e}, falling back to GCP STT")
+            logger.warning(f"ElevenLabs STT error: {e}")
 
-    # ── Fallback: GCP STT v2 inline bytes ───────────────────────
-    try:
-        client = speech_v2.SpeechClient()
-        recognizer = f"projects/{settings.GCP_PROJECT_ID}/locations/global/recognizers/_"
-        config = speech_v2.types.RecognitionConfig(
-            auto_decoding_config=speech_v2.types.AutoDetectDecodingConfig(),
-            language_codes=[language_code],
-            model="chirp",
-        )
-        request = speech_v2.types.RecognizeRequest(
-            recognizer=recognizer,
-            config=config,
-            content=audio_bytes,
-        )
-        resp = await asyncio.to_thread(client.recognize, request)
-        segments = []
-        for result in resp.results:
-            alt = result.alternatives[0]
-            segments.append({"speaker": "Patient", "text": alt.transcript})
-        full_text = " ".join(s["text"] for s in segments)
-        return {"full_text": full_text, "segments": segments}
-    except Exception as e:
-        logger.warning(f"GCP STT fallback failed: {e}")
-        return {"full_text": "", "segments": []}
+    return {"full_text": "", "segments": []}
 
 
-async def transcribe_audio(gcs_uri: str, language_code: str = "en-IN") -> dict[str, Any]:
+async def transcribe_audio(gcs_uri: str) -> dict[str, Any]:
     """Transcribe audio from a GCS URI (used for consultation uploads, not voice chat)."""
     try:
         bucket_name, blob_name = gcs_uri.replace("gs://", "").split("/", 1)
@@ -234,7 +305,7 @@ async def transcribe_audio(gcs_uri: str, language_code: str = "en-IN") -> dict[s
             _get_storage().bucket(bucket_name).blob(blob_name).download_as_bytes
         )
         filename = blob_name.split("/")[-1] or "audio.wav"
-        return await transcribe_audio_bytes(audio_bytes, filename=filename, language_code=language_code)
+        return await transcribe_audio_bytes(audio_bytes, filename=filename)
     except Exception as e:
         logger.warning(f"GCS download for transcription failed: {e}")
         return {"full_text": "", "segments": []}
@@ -281,6 +352,21 @@ VOICE_LOCALE_MAP = {
     "en": "en-IN",
 }
 
+# Maps ISO-639-1 language code → ElevenLabs voice ID.
+# Used by synthesize_speech() to select the correct multilingual voice.
+ELEVENLABS_VOICE_ID_MAP: dict[str, str] = {
+    "en": "7wlfJf72PCt9FjPj0Beg",
+    "hi": "zEvjs17jNQ2fH5FxAat2",
+    "ta": "gJvkwI7wGFW2czmyfJhp",
+    "te": "QKyvRuehpb8zB3cRkzIn",
+    "bn": "iuABfyf7pRoBzuPqzUCt",
+    "mr": "UN3inGyhBayPW0A8lscL",
+    "gu": "v9ZPGDUUXnWEDCiJUQkk",
+    "kn": "UeUC009F3NYPIArcZmq0",
+    "ml": "OVkoEbwxsYHiSRMFV9t3",
+    "pa": "ttyKbP9zTIRyRCN6b2Ye",
+}
+
 
 def translate_text(text: str, target_language: str = "hi") -> str:
     """Translates text via Google Cloud Translation API."""
@@ -293,11 +379,17 @@ def translate_text(text: str, target_language: str = "hi") -> str:
 
 
 def synthesize_speech(text: str, language_code: str = "hi-IN") -> bytes:
-    """Text-to-Speech synthesis returning MP3 bytes or ElevenLabs synthesis."""
+    """Text-to-Speech synthesis returning MP3 bytes.
+
+    Selects the ElevenLabs voice based on the language prefix of `language_code`
+    (e.g. 'hi-IN' → lang 'hi'). Falls back to GCP TTS when ElevenLabs is unavailable.
+    """
     if settings.ELEVENLABS_API_KEY:
         try:
-            logger.info("Attempting ElevenLabs Text-to-Speech synthesis...")
-            url = f"https://api.elevenlabs.io/v1/text-to-speech/{settings.ELEVENLABS_VOICE_ID}"
+            lang = language_code.split("-")[0].lower()
+            voice_id = ELEVENLABS_VOICE_ID_MAP.get(lang, settings.ELEVENLABS_VOICE_ID)
+            logger.info(f"ElevenLabs TTS: lang={lang}, voice_id={voice_id}")
+            url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
             headers = {
                 "xi-api-key": settings.ELEVENLABS_API_KEY,
                 "Content-Type": "application/json"

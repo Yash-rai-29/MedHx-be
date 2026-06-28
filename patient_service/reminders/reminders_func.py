@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import uuid
 from datetime import datetime, date, timedelta, UTC
@@ -5,14 +6,18 @@ from typing import Optional
 
 from google.cloud import firestore
 
-import asyncio
+
+class ReminderNotFoundError(Exception):
+    """Raised when a reminder document does not exist or the caller does not own it."""
 
 from common_code.cloud_tasks import cancel_reminder_task, create_cloud_task
 from common_code.config import settings
 from common_code.notification_dispatcher import dispatch_notification
 from patient_service.reminders.reminders_model import (
     BatchReminderCreateResponse,
+    MealTiming,
     ReminderCreateRequest,
+    ReminderListItem,
     ReminderResponse,
     ReminderSchedule,
     ReminderStatus,
@@ -28,8 +33,69 @@ from zoneinfo import ZoneInfo
 
 logger = logging.getLogger(__name__)
 
-MAX_TASK_DAYS    = 30
+MAX_TASK_DAYS     = 30
 RELAY_BUFFER_DAYS = 27
+MEAL_OFFSET_MIN   = 15   # minutes before/after the meal time
+
+DEFAULT_MEAL_TIMES = {
+    "breakfast": "08:00",
+    "lunch":     "13:00",
+    "dinner":    "20:00",
+}
+
+_MEAL_TIMING_MAP = {
+    MealTiming.before_breakfast: ("breakfast", -MEAL_OFFSET_MIN),
+    MealTiming.after_breakfast:  ("breakfast",  MEAL_OFFSET_MIN),
+    MealTiming.before_lunch:     ("lunch",     -MEAL_OFFSET_MIN),
+    MealTiming.after_lunch:      ("lunch",      MEAL_OFFSET_MIN),
+    MealTiming.before_dinner:    ("dinner",    -MEAL_OFFSET_MIN),
+    MealTiming.after_dinner:     ("dinner",     MEAL_OFFSET_MIN),
+}
+
+
+# ══════════════════════════════════════════════════════════════
+#  Meal-time resolution helpers
+# ══════════════════════════════════════════════════════════════
+
+async def _get_patient_meal_times(uid: str, db: firestore.AsyncClient) -> dict:
+    """Returns the patient's meal times from their profile, falling back to defaults."""
+    try:
+        snap = await db.collection(settings.PATIENTS_COLLECTION).document(uid).get()
+        if snap.exists:
+            profile_meals = (snap.to_dict() or {}).get("meal_times") or {}
+            return {
+                "breakfast": profile_meals.get("breakfast") or DEFAULT_MEAL_TIMES["breakfast"],
+                "lunch":     profile_meals.get("lunch")     or DEFAULT_MEAL_TIMES["lunch"],
+                "dinner":    profile_meals.get("dinner")    or DEFAULT_MEAL_TIMES["dinner"],
+            }
+    except Exception as e:
+        logger.warning(f"Could not read meal times for {uid}: {e}")
+    return DEFAULT_MEAL_TIMES.copy()
+
+
+def _meal_timing_to_hhmm(meal_timing: MealTiming, meal_times: dict) -> str:
+    """Converts a MealTiming value + profile meal times to a concrete HH:MM string."""
+    meal_key, offset = _MEAL_TIMING_MAP[meal_timing]
+    base = meal_times.get(meal_key) or DEFAULT_MEAL_TIMES[meal_key]
+    h, m = map(int, base.split(":"))
+    total = h * 60 + m + offset
+    total = max(0, min(23 * 60 + 59, total))   # clamp within a single day
+    return f"{total // 60:02d}:{total % 60:02d}"
+
+
+async def _resolve_schedule(
+    schedule: ReminderSchedule, uid: str, db: firestore.AsyncClient
+) -> ReminderSchedule:
+    """Returns a schedule copy with time_of_day resolved from the patient's meal times.
+
+    For specific_time or no meal_timing, the original schedule is returned unchanged.
+    For meal-relative timings the patient's profile is read and ±15 min is applied.
+    """
+    if not schedule.meal_timing or schedule.meal_timing == MealTiming.specific_time:
+        return schedule
+    meal_times = await _get_patient_meal_times(uid, db)
+    resolved_time = _meal_timing_to_hhmm(schedule.meal_timing, meal_times)
+    return schedule.model_copy(update={"time_of_day": resolved_time})
 
 
 # ══════════════════════════════════════════════════════════════
@@ -38,9 +104,15 @@ RELAY_BUFFER_DAYS = 27
 
 def compute_next_trigger(schedule: ReminderSchedule, after: datetime) -> Optional[datetime]:
     """Returns the next UTC datetime this schedule should fire after `after`, or None if exhausted.
-    
+
     All time_of_day values are interpreted in the Asia/Kolkata (IST) timezone.
+    For meal-relative schedules, call _resolve_schedule() first so time_of_day is populated.
     """
+    if not schedule.time_of_day:
+        raise ValueError(
+            "ReminderSchedule.time_of_day is not set. "
+            "Call _resolve_schedule() before compute_next_trigger() for meal-relative reminders."
+        )
     kolkata_tz = ZoneInfo("Asia/Kolkata")
     hour, minute = map(int, schedule.time_of_day.split(":"))
     end = schedule.end_date
@@ -128,7 +200,7 @@ def schedule_next_task(reminder_id: str, patient_id: str, target_at: datetime) -
     now    = datetime.now(UTC)
     delta  = (target_at - now).total_seconds()
     max_s  = MAX_TASK_DAYS * 86400
-    base   = (settings.SERVICE_URL or "http://localhost:8001").rstrip("/")
+    base   = (settings.SERVICE_URL or "https://patient-service-302860899707.asia-south1.run.app").rstrip("/")
     url    = f"{base}/reminders/trigger"
 
     if delta <= max_s:
@@ -159,23 +231,34 @@ def _schedule_to_dict(schedule: ReminderSchedule) -> dict:
     return schedule.model_dump(mode="json")
 
 
-def _doc_to_response(doc_id: str, d: dict) -> ReminderResponse:
-    """Convert a Firestore document dict to ReminderResponse."""
-    schedule_raw = d.get("schedule", {})
-    # Convert any Firestore date/datetime objects in schedule back to strings for Pydantic
+def _parse_schedule(d: dict) -> ReminderSchedule:
+    """Parse a Firestore doc dict into a ReminderSchedule, normalising date types."""
+    raw = d.get("schedule", {})
+    if not isinstance(raw, dict):
+        raw = {"recurrence": "daily", "time_of_day": "09:00"}
     for key in ("start_date", "end_date"):
-        val = schedule_raw.get(key)
+        val = raw.get(key)
         if val is not None and hasattr(val, "strftime"):
-            schedule_raw[key] = val.strftime("%Y-%m-%d")
-    if schedule_raw.get("specific_dates"):
-        schedule_raw["specific_dates"] = [
+            raw[key] = val.strftime("%Y-%m-%d")
+    if raw.get("specific_dates"):
+        raw["specific_dates"] = [
             v.strftime("%Y-%m-%d") if hasattr(v, "strftime") else v
-            for v in schedule_raw["specific_dates"]
+            for v in raw["specific_dates"]
         ]
+    return ReminderSchedule(**raw)
 
+
+def _parse_med(d: dict) -> "MedicineReminderDetails | None":
     med = d.get("medicine_details")
-    fup = d.get("follow_up_details")
+    return MedicineReminderDetails(**med) if isinstance(med, dict) else None
 
+
+def _parse_fup(d: dict) -> "FollowUpReminderDetails | None":
+    fup = d.get("follow_up_details")
+    return FollowUpReminderDetails(**fup) if isinstance(fup, dict) else None
+
+
+def _doc_to_response(doc_id: str, d: dict) -> ReminderResponse:
     return ReminderResponse(
         id=doc_id,
         patientId=d["patientId"],
@@ -183,9 +266,9 @@ def _doc_to_response(doc_id: str, d: dict) -> ReminderResponse:
         status=d.get("status", ReminderStatus.active),
         title=d.get("title", ""),
         notes=d.get("notes"),
-        schedule=ReminderSchedule(**schedule_raw),
-        medicine_details=MedicineReminderDetails(**med) if med else None,
-        follow_up_details=FollowUpReminderDetails(**fup) if fup else None,
+        schedule=_parse_schedule(d),
+        medicine_details=_parse_med(d),
+        follow_up_details=_parse_fup(d),
         consultation_id=d.get("consultation_id"),
         notification_enabled=d.get("notification_enabled", True),
         next_trigger_at=d.get("next_trigger_at"),
@@ -204,8 +287,21 @@ async def create_reminder(
     req: ReminderCreateRequest,
     db: firestore.AsyncClient,
 ) -> ReminderResponse:
-    now     = datetime.now(UTC)
-    next_dt = compute_next_trigger(req.schedule, after=now)
+    now = datetime.now(UTC)
+
+    # For follow-up reminders, appointment_time overrides schedule time_of_day
+    schedule = req.schedule
+    if (
+        req.type == ReminderType.follow_up
+        and req.follow_up_details
+        and req.follow_up_details.appointment_time
+    ):
+        schedule = schedule.model_copy(
+            update={"time_of_day": req.follow_up_details.appointment_time, "meal_timing": None}
+        )
+
+    resolved = await _resolve_schedule(schedule, uid, db)
+    next_dt  = compute_next_trigger(resolved, after=now)
     if not next_dt:
         raise ValueError("Schedule produces no future occurrences.")
 
@@ -250,17 +346,43 @@ async def batch_create_reminders(
 _FAR_FUTURE = datetime(9999, 12, 31, tzinfo=UTC)
 
 
+_REMINDER_LIST_FIELDS = [
+    "patientId", "type", "status", "title", "notes",
+    "schedule", "medicine_details", "follow_up_details",
+    "notification_enabled", "next_trigger_at", "created_at",
+]
+
+
+def _to_list_item(doc_id: str, d: dict) -> ReminderListItem:
+    return ReminderListItem(
+        id=doc_id,
+        patientId=d["patientId"],
+        type=d.get("type", ReminderType.medicine),
+        status=d.get("status", ReminderStatus.active),
+        title=d.get("title", ""),
+        notes=d.get("notes"),
+        schedule=_parse_schedule(d),
+        medicine_details=_parse_med(d),
+        follow_up_details=_parse_fup(d),
+        notification_enabled=d.get("notification_enabled", True),
+        next_trigger_at=d.get("next_trigger_at"),
+        created_at=d.get("created_at", datetime.now(UTC)),
+    )
+
+
 async def get_reminders(
     uid: str,
     db: firestore.AsyncClient,
     status: Optional[ReminderStatus] = None,
     reminder_type: Optional[ReminderType] = None,
-) -> list[ReminderResponse]:
-    query = db.collection(settings.REMINDERS_COLLECTION).where("patientId", "==", uid)
+) -> list[ReminderListItem]:
+    query = (
+        db.collection(settings.REMINDERS_COLLECTION)
+        .where("patientId", "==", uid)
+        .select(_REMINDER_LIST_FIELDS)
+    )
     if status:
         query = query.where("status", "==", status.value)
-    # No order_by here — composite indexes may not be deployed yet.
-    # Sorting is done in Python after fetch.
     docs = await query.get()
     results = []
     for doc in docs:
@@ -268,7 +390,7 @@ async def get_reminders(
         if reminder_type and d.get("type") != reminder_type.value:
             continue
         try:
-            results.append(_doc_to_response(doc.id, d))
+            results.append(_to_list_item(doc.id, d))
         except Exception as e:
             logger.warning(f"Skipping malformed reminder {doc.id}: {e}")
     results.sort(key=lambda r: r.next_trigger_at or _FAR_FUTURE)
@@ -282,7 +404,7 @@ async def get_reminder(
 ) -> ReminderResponse:
     doc = await db.collection(settings.REMINDERS_COLLECTION).document(reminder_id).get()
     if not doc.exists:
-        raise ValueError("Reminder not found.")
+        raise ReminderNotFoundError("Reminder not found.")
     d = doc.to_dict()
     if d.get("patientId") != uid:
         raise PermissionError("Access is unauthorized.")
@@ -298,10 +420,14 @@ async def update_reminder(
     doc_ref = db.collection(settings.REMINDERS_COLLECTION).document(reminder_id)
     snap    = await doc_ref.get()
     if not snap.exists:
-        raise ValueError("Reminder not found.")
+        raise ReminderNotFoundError("Reminder not found.")
     d = snap.to_dict()
     if d.get("patientId") != uid:
         raise PermissionError("Access is unauthorized.")
+
+    # Read the existing trigger time once — used to cancel the old Cloud Task
+    # before any rescheduling so we never get a 409 on the new task name.
+    old_trigger = d.get("next_trigger_at")
 
     update: dict = {}
     if req.title is not None:
@@ -313,21 +439,35 @@ async def update_reminder(
 
     if req.status == ReminderStatus.paused:
         update["status"] = ReminderStatus.paused.value
+        # Cancel the pending Cloud Task so it doesn't fire while paused
+        if old_trigger:
+            await asyncio.to_thread(cancel_reminder_task, reminder_id, old_trigger)
 
     elif req.status == ReminderStatus.active:
-        # Resume: compute next occurrence from now and restart chain
-        existing_schedule = ReminderSchedule(**d["schedule"])
-        next_dt = compute_next_trigger(existing_schedule, after=datetime.now(UTC))
+        # Resume: re-resolve meal timing in case profile changed, then rechain
+        schedule_raw = d.get("schedule", {})
+        if not isinstance(schedule_raw, dict):
+            schedule_raw = {"recurrence": "daily", "time_of_day": "09:00"}
+        existing_schedule = ReminderSchedule(**schedule_raw)
+        resolved = await _resolve_schedule(existing_schedule, uid, db)
+        next_dt  = compute_next_trigger(resolved, after=datetime.now(UTC))
         if not next_dt:
-            raise ValueError("No future occurrences — reminder has expired.")
+            raise ValueError("Reminder has no future occurrences and cannot be resumed.")
+        # Cancel old task before creating the new one to avoid 409
+        if old_trigger:
+            await asyncio.to_thread(cancel_reminder_task, reminder_id, old_trigger)
         update["status"]          = ReminderStatus.active.value
         update["next_trigger_at"] = next_dt
         schedule_next_task(reminder_id, uid, next_dt)
 
     if req.schedule is not None:
-        next_dt = compute_next_trigger(req.schedule, after=datetime.now(UTC))
+        resolved = await _resolve_schedule(req.schedule, uid, db)
+        next_dt  = compute_next_trigger(resolved, after=datetime.now(UTC))
         if not next_dt:
             raise ValueError("New schedule produces no future occurrences.")
+        # Cancel old task before creating the new one to avoid 409
+        if old_trigger:
+            await asyncio.to_thread(cancel_reminder_task, reminder_id, old_trigger)
         update["schedule"]         = _schedule_to_dict(req.schedule)
         update["next_trigger_at"]  = next_dt
         schedule_next_task(reminder_id, uid, next_dt)
@@ -347,7 +487,7 @@ async def delete_reminder(
     doc_ref = db.collection(settings.REMINDERS_COLLECTION).document(reminder_id)
     snap    = await doc_ref.get()
     if not snap.exists:
-        raise ValueError("Reminder not found.")
+        raise ReminderNotFoundError("Reminder not found.")
     d = snap.to_dict()
     if d.get("patientId") != uid:
         raise PermissionError("Access is unauthorized.")
@@ -411,9 +551,10 @@ async def handle_trigger(payload: TriggerPayload, db: firestore.AsyncClient) -> 
         extra_data={"reminder_id": reminder_id, "title": d.get("title", "")},
     )
 
-    # Chain to next occurrence
+    # Chain to next occurrence — re-resolve meal timing so profile changes take effect
     schedule  = ReminderSchedule(**d["schedule"])
-    next_dt   = compute_next_trigger(schedule, after=target_at)
+    resolved  = await _resolve_schedule(schedule, patient_id, db)
+    next_dt   = compute_next_trigger(resolved, after=target_at)
 
     if next_dt:
         schedule_next_task(reminder_id, patient_id, next_dt)

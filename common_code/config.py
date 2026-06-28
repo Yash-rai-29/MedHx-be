@@ -66,6 +66,7 @@ class Settings(BaseSettings):
 
     # ── ElevenLabs ────────────────────────────────────────────
     ELEVENLABS_API_KEY: Optional[str] = None
+    # Fallback voice ID used when a language is not in ELEVENLABS_VOICE_ID_MAP (gcp_clients.py)
     ELEVENLABS_VOICE_ID: str = "zEvjs17jNQ2fH5FxAat2"
     ELEVENLABS_TTS_MODEL_ID: str = "eleven_turbo_v2_5"
     ELEVENLABS_STT_MODEL_ID: str = "scribe_v2"

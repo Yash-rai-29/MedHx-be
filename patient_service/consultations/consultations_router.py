@@ -7,6 +7,7 @@ from common_code.config import settings
 from common_code.firestore import get_db, log_audit_event
 from common_code.firebase_auth import require_role
 from patient_service.consultations.consultations_model import (
+    AudioConsultationListItem,
     AudioConsultationResponse,
     AudioConsultationUploadResponse,
     DeleteAudioConsultationResponse,
@@ -20,6 +21,7 @@ from patient_service.consultations.consultations_func import (
     get_patient_consultation_by_id,
     listen_consultation_summary,
     translate_consultation_summary,
+    translate_audio_consultation_summary,
     background_process_audio_consultation,
     delete_audio_consultation,
     get_audio_consultation,
@@ -110,7 +112,7 @@ async def upload_audio_consultation_endpoint(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.get("/audio", response_model=List[AudioConsultationResponse])
+@router.get("/audio", response_model=List[AudioConsultationListItem])
 async def list_audio_consultations(
     current_user: dict = Depends(patient_gate),
     db: firestore.AsyncClient = Depends(get_db),
@@ -193,6 +195,29 @@ async def refine_audio_consultation_endpoint(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+
+@router.post("/audio/{consultation_id}/translate", response_model=TranslateSummaryResponse)
+async def translate_audio_consultation_endpoint(
+    consultation_id: str,
+    req: TranslateSummaryRequest,
+    current_user: dict = Depends(patient_gate),
+    db: firestore.AsyncClient = Depends(get_db),
+):
+    """Translates the audio consultation summary into the requested language."""
+    uid = current_user["uid"]
+    try:
+        text = await translate_audio_consultation_summary(consultation_id, uid, req.target_language, db)
+        await log_audit_event(actor=uid, action="TRANSLATE_AUDIO_CONSULTATION_SUMMARY",
+                              target=consultation_id, details={"language": req.target_language})
+        return TranslateSummaryResponse(translated_text=text, language=req.target_language)
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.get(
     "/audio/{consultation_id}/listen",
     responses={200: {"content": {"audio/mpeg": {}}, "description": "MP3 of the consultation summary"}},
@@ -225,59 +250,59 @@ async def listen_audio_consultation_endpoint(
 #  Legacy — doctor-published consultations (parameterized last)
 # ══════════════════════════════════════════════════════════════
 
-@router.get("/{consultation_id}", response_model=PatientConsultationDetail)
-async def get_consultation_by_id(
-    consultation_id: str,
-    current_user: dict = Depends(patient_gate),
-    db: firestore.AsyncClient = Depends(get_db),
-):
-    """Gets a single doctor-published consultation by ID."""
-    try:
-        return await get_patient_consultation_by_id(consultation_id, current_user["uid"], db)
-    except PermissionError as e:
-        raise HTTPException(status_code=403, detail=str(e))
-    except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
+# @router.get("/{consultation_id}", response_model=PatientConsultationDetail)
+# async def get_consultation_by_id(
+#     consultation_id: str,
+#     current_user: dict = Depends(patient_gate),
+#     db: firestore.AsyncClient = Depends(get_db),
+# ):
+#     """Gets a single doctor-published consultation by ID."""
+#     try:
+#         return await get_patient_consultation_by_id(consultation_id, current_user["uid"], db)
+#     except PermissionError as e:
+#         raise HTTPException(status_code=403, detail=str(e))
+#     except ValueError as e:
+#         raise HTTPException(status_code=404, detail=str(e))
 
 
-@router.post("/{consultation_id}/translate", response_model=TranslateSummaryResponse)
-async def translate_summary(
-    consultation_id: str,
-    req: TranslateSummaryRequest,
-    current_user: dict = Depends(patient_gate),
-    db: firestore.AsyncClient = Depends(get_db),
-):
-    """Translates the doctor-consultation summary into the requested language."""
-    uid = current_user["uid"]
-    try:
-        text = await translate_consultation_summary(consultation_id, uid, req.target_language, db)
-        await log_audit_event(actor=uid, action="TRANSLATE_CONSULTATION_SUMMARY",
-                              target=consultation_id, details={"language": req.target_language})
-        return TranslateSummaryResponse(translated_text=text, language=req.target_language)
-    except PermissionError as e:
-        raise HTTPException(status_code=403, detail=str(e))
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+# @router.post("/{consultation_id}/translate", response_model=TranslateSummaryResponse)
+# async def translate_summary(
+#     consultation_id: str,
+#     req: TranslateSummaryRequest,
+#     current_user: dict = Depends(patient_gate),
+#     db: firestore.AsyncClient = Depends(get_db),
+# ):
+#     """Translates the doctor-consultation summary into the requested language."""
+#     uid = current_user["uid"]
+#     try:
+#         text = await translate_consultation_summary(consultation_id, uid, req.target_language, db)
+#         await log_audit_event(actor=uid, action="TRANSLATE_CONSULTATION_SUMMARY",
+#                               target=consultation_id, details={"language": req.target_language})
+#         return TranslateSummaryResponse(translated_text=text, language=req.target_language)
+#     except PermissionError as e:
+#         raise HTTPException(status_code=403, detail=str(e))
+#     except ValueError as e:
+#         raise HTTPException(status_code=400, detail=str(e))
 
 
-@router.get(
-    "/{consultation_id}/listen",
-    responses={200: {"content": {"audio/mpeg": {}}, "description": "MP3 of the consultation summary"}},
-)
-async def listen_summary(
-    consultation_id: str,
-    lang: SupportedLanguage = Query(SupportedLanguage.hindi, description="Language for TTS"),
-    current_user: dict = Depends(patient_gate),
-    db: firestore.AsyncClient = Depends(get_db),
-):
-    """Returns synthesized speech (MP3) of the doctor-consultation summary."""
-    uid = current_user["uid"]
-    try:
-        audio = await listen_consultation_summary(consultation_id, uid, lang, db)
-        await log_audit_event(actor=uid, action="LISTEN_CONSULTATION_SUMMARY",
-                              target=consultation_id, details={"language": lang})
-        return Response(content=audio, media_type="audio/mpeg")
-    except PermissionError as e:
-        raise HTTPException(status_code=403, detail=str(e))
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+# @router.get(
+#     "/{consultation_id}/listen",
+#     responses={200: {"content": {"audio/mpeg": {}}, "description": "MP3 of the consultation summary"}},
+# )
+# async def listen_summary(
+#     consultation_id: str,
+#     lang: SupportedLanguage = Query(SupportedLanguage.hindi, description="Language for TTS"),
+#     current_user: dict = Depends(patient_gate),
+#     db: firestore.AsyncClient = Depends(get_db),
+# ):
+#     """Returns synthesized speech (MP3) of the doctor-consultation summary."""
+#     uid = current_user["uid"]
+#     try:
+#         audio = await listen_consultation_summary(consultation_id, uid, lang, db)
+#         await log_audit_event(actor=uid, action="LISTEN_CONSULTATION_SUMMARY",
+#                               target=consultation_id, details={"language": lang})
+#         return Response(content=audio, media_type="audio/mpeg")
+#     except PermissionError as e:
+#         raise HTTPException(status_code=403, detail=str(e))
+#     except ValueError as e:
+#         raise HTTPException(status_code=400, detail=str(e))

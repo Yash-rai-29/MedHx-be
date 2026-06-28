@@ -76,9 +76,18 @@ CHATBOT_TOOLS = genai_types.Tool(
                         type="STRING",
                         description="'medicine' for a medication reminder, 'follow_up' for a doctor visit",
                     ),
+                    "meal_timing": genai_types.Schema(
+                        type="STRING",
+                        description=(
+                            "Meal-relative timing: 'before_breakfast', 'after_breakfast', "
+                            "'before_lunch', 'after_lunch', 'before_dinner', 'after_dinner'. "
+                            "Use this instead of time_of_day when the patient says things like "
+                            "'after breakfast' or 'before dinner'. Omit for a specific clock time."
+                        ),
+                    ),
                     "time_of_day": genai_types.Schema(
                         type="STRING",
-                        description="Time in HH:MM 24-hour format, e.g. '09:00'",
+                        description="Time in HH:MM 24-hour format, e.g. '09:00'. Omit when meal_timing is set.",
                     ),
                     "recurrence": genai_types.Schema(
                         type="STRING",
@@ -237,17 +246,22 @@ async def _tool_list_reminders(uid: str, args: dict, db: firestore.AsyncClient) 
 async def _tool_create_reminder(uid: str, args: dict, db: firestore.AsyncClient) -> str:
     from patient_service.reminders.reminders_func import create_reminder
     from patient_service.reminders.reminders_model import (
+        MealTiming,
         ReminderCreateRequest,
         ReminderSchedule,
         ReminderType,
         RecurrenceType,
         MedicineReminderDetails,
+        FollowUpReminderDetails,
     )
 
     rtype_str = (args.get("type") or "medicine").lower()
     rtype     = ReminderType.follow_up if "follow" in rtype_str else ReminderType.medicine
 
     recurrence_str = args.get("recurrence", "daily").lower()
+    # Follow-ups default to once
+    if rtype == ReminderType.follow_up and not args.get("recurrence"):
+        recurrence_str = "once"
     try:
         recurrence = RecurrenceType(recurrence_str)
     except ValueError:
@@ -266,11 +280,23 @@ async def _tool_create_reminder(uid: str, args: dict, db: firestore.AsyncClient)
         except ValueError:
             pass
 
+    # Resolve timing: prefer meal_timing over time_of_day
+    meal_timing = None
+    meal_timing_str = args.get("meal_timing")
+    if meal_timing_str:
+        try:
+            meal_timing = MealTiming(meal_timing_str)
+        except ValueError:
+            pass
+
+    time_of_day = args.get("time_of_day") or ("09:00" if not meal_timing else None)
+
     schedule = ReminderSchedule(
         recurrence=recurrence,
         start_date=start_date,
         end_date=end_date,
-        time_of_day=args.get("time_of_day", "09:00"),
+        time_of_day=time_of_day,
+        meal_timing=meal_timing,
     )
 
     med_details = None
@@ -280,10 +306,27 @@ async def _tool_create_reminder(uid: str, args: dict, db: firestore.AsyncClient)
             dosage=args.get("dosage"),
         )
 
+    fup_details = None
+    if rtype == ReminderType.follow_up:
+        appt_date = None
+        if args.get("appointment_date"):
+            try:
+                appt_date = datetime.date.fromisoformat(args["appointment_date"])
+            except ValueError:
+                pass
+        fup_details = FollowUpReminderDetails(
+            specialty=args.get("specialty"),
+            reason=args.get("notes"),
+            appointment_date=appt_date,
+            appointment_time=args.get("appointment_time") or args.get("time_of_day"),
+        )
+
     # Derive a sensible default title if Gemini didn't extract one
-    title = args.get("title") or (
-        f"{args.get('medicine_name', 'Daily')} Reminder at {args.get('time_of_day', '09:00')}"
-    )
+    if meal_timing:
+        timing_label = meal_timing.value.replace("_", " ")
+    else:
+        timing_label = f"at {time_of_day or '09:00'}"
+    title = args.get("title") or f"{args.get('medicine_name', 'Daily')} Reminder {timing_label}"
 
     req = ReminderCreateRequest(
         type=rtype,
@@ -291,6 +334,7 @@ async def _tool_create_reminder(uid: str, args: dict, db: firestore.AsyncClient)
         notes=args.get("notes"),
         schedule=schedule,
         medicine_details=med_details,
+        follow_up_details=fup_details,
     )
 
     reminder = await create_reminder(uid, req, db)
@@ -298,11 +342,15 @@ async def _tool_create_reminder(uid: str, args: dict, db: firestore.AsyncClient)
         reminder.next_trigger_at.astimezone(IST).strftime("%d %b %Y at %I:%M %p IST")
         if reminder.next_trigger_at else "soon"
     )
+    timing_display = (
+        meal_timing.value.replace("_", " ") if meal_timing
+        else f"at {schedule.time_of_day} IST"
+    )
     return (
         f"Reminder created successfully!\n"
         f"• Title: {reminder.title}\n"
         f"• Type: {reminder.type.value}\n"
-        f"• Schedule: {schedule.recurrence.value} at {schedule.time_of_day} IST\n"
+        f"• Schedule: {schedule.recurrence.value} {timing_display}\n"
         f"• First reminder: {next_fire}\n"
         f"• ID: {reminder.id}"
     )
@@ -372,18 +420,21 @@ async def try_tool_call(
         "When you have all required details, call the appropriate tool:\n"
         "• Patient wants to list/show documents → list_documents\n"
         "• Patient wants to list/show reminders → list_reminders (pass status filter if mentioned)\n"
-        "• Patient wants to create a reminder AND you have: title + time + recurrence → create_reminder\n"
+        "• Patient wants to create a reminder AND you have: title + timing + recurrence → create_reminder\n"
+        "  - Timing: use meal_timing (e.g. 'before_breakfast') if the patient mentions a meal; otherwise use time_of_day (HH:MM).\n"
         "  - Use today's date as start_date unless patient specifies one.\n"
         "  - type: 'medicine' for medication reminders, 'follow_up' for doctor/appointment reminders.\n"
+        "  - For follow_up: capture appointment_date and appointment_time if mentioned.\n"
         "• Patient wants to delete/cancel a reminder → delete_reminder (call list_reminders first if ID unknown)\n"
         "• Patient wants to pause/resume/modify a reminder → update_reminder\n\n"
         "━━ WAY 2: ASK ONE CLARIFYING QUESTION ━━\n"
         "If the patient wants to create a reminder but a required detail is missing, ask exactly ONE question:\n"
         "  Missing title/purpose? → Ask: 'What is this reminder for? (e.g. medicine name or appointment)'\n"
         "  Medicine type but no medicine name? → Ask: 'What is the medicine name and dosage?'\n"
-        "  No time specified? → Ask: 'What time would you like the reminder? (e.g. 9 AM)'\n"
+        "  No time specified? → Ask: 'When would you like the reminder? You can say a specific time (e.g. 9 AM) or relative to a meal (e.g. before breakfast, after lunch).'\n"
         "  No recurrence? → Ask: 'Should this repeat daily, weekly, or just once?'\n"
         "  Missing end date for medicine course? → Ask: 'How long should this reminder continue? Or should it repeat indefinitely?'\n"
+        "  Follow-up but no appointment date/time? → Ask: 'What is the appointment date and time?'\n"
         "Ask only ONE question per turn. Be brief and friendly.\n\n"
         "━━ WAY 3: RESPOND WITH EXACTLY THE WORD 'PASS' ━━\n"
         "For everything else — medical questions, health advice, greetings, report explanations — "

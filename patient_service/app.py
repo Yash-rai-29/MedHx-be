@@ -12,6 +12,7 @@ from patient_service.chatbot.chatbot_router import router as chatbot_router
 from patient_service.notifications.notifications_router import router as notifications_router
 from patient_service.consultations.consultations_router import router as consultations_router
 from patient_service.vitals.vitals_router import router as vitals_router
+from patient_service.dashboard.dashboard_router import router as dashboard_router
 
 def create_app() -> FastAPI:
     app = FastAPI(
@@ -38,6 +39,7 @@ def create_app() -> FastAPI:
     app.include_router(notifications_router, prefix="/notifications", tags=["In-App Notifications"])
     app.include_router(consultations_router, prefix="/consultations", tags=["Consultations"])
     app.include_router(vitals_router, prefix="/vitals", tags=["Vitals"])
+    app.include_router(dashboard_router, prefix="/dashboard", tags=["Dashboard"])
 
     
     @app.get("/health", tags=["Health"])
