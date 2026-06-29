@@ -66,6 +66,7 @@ def test_get_patient_documents(client, mock_db, mock_user):
             "patientId": mock_user["uid"],
             "fileRef": "report1.pdf",
             "type": "lab_report",
+            "title": "Lab Report Title",
             "raw_text": "Sample text",
             "summary": "Sample summary",
             "createdAt": datetime.datetime.utcnow()
@@ -76,7 +77,8 @@ def test_get_patient_documents(client, mock_db, mock_user):
     data = response.json()
     assert len(data) == 1
     assert data[0]["id"] == "doc-1"
-    assert data[0]["summary"] == "Sample summary"
+    assert data[0]["file_path"] == "report1.pdf"
+    assert data[0]["title"] == "Lab Report Title"
 
 def test_translate_document_summary(client, mock_db, mock_user, mock_gcp_services):
     mock_db.db_store[settings.DOCUMENTS_COLLECTION] = {

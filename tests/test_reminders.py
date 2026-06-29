@@ -93,22 +93,29 @@ def test_trigger_notification_callback(client, mock_db, mock_user):
         "type": "notify"
     }
     
-    with patch("common_code.notification_dispatcher.send_push_notification") as mock_send_push, \
+    with patch("common_code.notification_dispatcher.messaging.send") as mock_send, \
          patch("patient_service.reminders.reminders_func.create_cloud_task") as mock_cloud_task:
-        mock_send_push.return_value = "projects/mock/messages/12345"
-        mock_cloud_task.return_value = "projects/mock/tasks/123"
+        mock_send.return_value = "projects/mock/messages/12345"
+        headers = {"X-Cloud-Tasks-Secret": "local-tasks-secret"}
         
-        response = client.post("/reminders/trigger", json=payload)
+        from firebase_admin import messaging as fb_messaging
+        fb_messaging.Message.reset_mock()
+        fb_messaging.Notification.reset_mock()
+        
+        response = client.post("/reminders/trigger", json=payload, headers=headers)
         assert response.status_code == 200
         assert response.json() == {"status": "ok"}
         
         # Verify push was sent
-        assert mock_send_push.call_count == 1
-        _, kwargs = mock_send_push.call_args
+        assert fb_messaging.Message.call_count == 1
+        _, kwargs = fb_messaging.Message.call_args
         assert kwargs["token"] == "mock-fcm-token-12345"
-        assert "Time for your medicine" in kwargs["title"]
-        assert "Amoxicillin" in kwargs["body"]
-
+        
+        assert fb_messaging.Notification.call_count == 1
+        _, notif_kwargs = fb_messaging.Notification.call_args
+        assert "Time for your medicine" in notif_kwargs["title"]
+        assert "Amoxicillin" in notif_kwargs["body"]
+ 
         assert kwargs["data"]["type"] == "medicine"
         assert kwargs["data"]["patient_id"] == mock_user["uid"]
         assert kwargs["data"]["reminder_id"] == "reminder-2"
@@ -166,9 +173,9 @@ def test_pubsub_handler_creates_reminders(client, mock_db, mock_user):
         }
     }
     
-    # Dynamically compute future times in Asia/Kolkata timezone
+    # Lock the test run date and time to avoid rollover issues
     from zoneinfo import ZoneInfo
-    now_local = datetime.datetime.now(ZoneInfo("Asia/Kolkata"))
+    now_local = datetime.datetime(2026, 6, 28, 9, 0, tzinfo=ZoneInfo("Asia/Kolkata")) # 9:00 AM IST
     time_1 = (now_local + datetime.timedelta(hours=2)).strftime("%H:%M")
     time_2 = (now_local + datetime.timedelta(hours=3)).strftime("%H:%M")
 
@@ -217,13 +224,25 @@ def test_pubsub_handler_creates_reminders(client, mock_db, mock_user):
         "subscription": "projects/medhx-care-ai/subscriptions/consultation-published-sub"
     }
     
-    with patch("patient_service.reminders.reminders_func.create_cloud_task") as mock_schedule:
+    # Custom MockDatetime class subclassing datetime.datetime
+    class MockDatetime(datetime.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            val = datetime.datetime(2026, 6, 28, 3, 30, tzinfo=datetime.UTC)
+            if tz:
+                return val.astimezone(tz)
+            return val
+
+    with patch("patient_service.reminders.reminders_func.datetime", MockDatetime), \
+         patch("patient_service.reminders.reminders_router._datetime", MockDatetime), \
+         patch("patient_service.reminders.reminders_func.create_cloud_task") as mock_schedule:
         mock_schedule.return_value = "projects/medhx-care-ai/queues/notification-queue/tasks/task-mock"
         
         response = client.post("/reminders/pubsub-handler", json=envelope)
         assert response.status_code == 200
-        assert response.json()["status"] == "ok"
-        assert response.json()["created"] == 2
+        res = response.json()
+        assert res["status"] == "ok", f"Status not ok: {res}"
+        assert res["created"] == 2, f"Created {res['created']} instead of 2. Failed: {res.get('failed')}"
         
         # Verify reminders written to Firestore
         reminders = mock_db.db_store[settings.REMINDERS_COLLECTION]

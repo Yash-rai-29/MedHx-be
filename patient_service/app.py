@@ -21,13 +21,16 @@ def create_app() -> FastAPI:
         version="1.0.0"
     )
     
-    # Configure CORS
+    # Configure CORS — origins come from config so they can be set per-environment
+    # via the ALLOWED_ORIGINS env var in Cloud Run.
+    # Mobile apps (Flutter) do not send CORS preflight, so this only affects web clients.
+    allowed_origins = [o.strip() for o in settings.ALLOWED_ORIGINS.split() if o.strip()]
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
+        allow_origins=allowed_origins,
         allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
+        allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+        allow_headers=["Authorization", "Content-Type", "X-Cloud-Tasks-Secret"],
     )
     
     # Include routers

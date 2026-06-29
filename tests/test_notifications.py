@@ -14,9 +14,8 @@ async def test_dispatch_notification_creates_db_record(client, mock_db, mock_use
             "fcm_token": "token-123"
         }
     }
-    
-    # We patch send_push_notification to return a mock message ID
-    with patch("common_code.notification_dispatcher.send_push_notification") as mock_send:
+    # We patch messaging.send to return a mock message ID
+    with patch("common_code.notification_dispatcher.messaging.send") as mock_send:
         mock_send.return_value = "msg-111"
         
         success = await dispatch_notification(
@@ -248,7 +247,7 @@ async def test_notification_templates_and_formatting(client, mock_db, mock_user)
     }
 
     # Test 1: Resolve using template defaults (title and body are None)
-    with patch("common_code.notification_dispatcher.send_push_notification") as mock_send:
+    with patch("common_code.notification_dispatcher.messaging.send") as mock_send:
         mock_send.return_value = "msg-222"
         
         success = await dispatch_notification(
@@ -275,7 +274,7 @@ async def test_notification_templates_and_formatting(client, mock_db, mock_user)
 
 
     # Test 2: Resolve with custom formatting & key missing safety
-    with patch("common_code.notification_dispatcher.send_push_notification") as mock_send:
+    with patch("common_code.notification_dispatcher.messaging.send") as mock_send:
         mock_send.return_value = "msg-333"
         
         success = await dispatch_notification(

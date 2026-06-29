@@ -56,7 +56,7 @@ def test_get_and_update_patient_profile(client, mock_db, mock_user):
         "location": "Pune, India",
         "date_of_birth": "1994-01-01" # age recalculates: 2026 - 1994 = 32
     }
-    update_resp = client.put("/profile", json=update_payload)
+    update_resp = client.patch("/profile", json=update_payload)
     assert update_resp.status_code == 200
     updated_data = update_resp.json()
     assert "Dust" in updated_data["allergies"]

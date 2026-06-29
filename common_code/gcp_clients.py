@@ -113,11 +113,11 @@ def generate_signed_upload_url(blob_name: str, expiration_minutes: int = 15) -> 
         )
     except Exception as e:
         logger.error(f"GCS signed upload URL error: {e}")
-        return f"http://localhost:8001/mock-upload/{blob_name}"
+        raise
 
 
-def generate_signed_download_url(blob_name: str, expiration_minutes: int = 60) -> str:
-    """Short-lived V4 signed URL for download / view."""
+def generate_signed_download_url(blob_name: str, expiration_minutes: int = 60) -> str | None:
+    """Short-lived V4 signed URL for download / view. Returns None if signing fails."""
     try:
         bucket = _get_signing_storage().bucket(settings.STORAGE_BUCKET_NAME)
         blob = bucket.blob(blob_name)
@@ -128,7 +128,7 @@ def generate_signed_download_url(blob_name: str, expiration_minutes: int = 60) -
         )
     except Exception as e:
         logger.error(f"GCS signed download URL error: {e}")
-        return f"http://localhost:8001/mock-download/{blob_name}"
+        return None
 
 
 def upload_bytes_to_gcs(blob_name: str, data: bytes, content_type: str = "application/pdf") -> str:
@@ -140,7 +140,7 @@ def upload_bytes_to_gcs(blob_name: str, data: bytes, content_type: str = "applic
         return f"gs://{settings.STORAGE_BUCKET_NAME}/{blob_name}"
     except Exception as e:
         logger.error(f"GCS upload error: {e}")
-        return f"gs://mock/{blob_name}"
+        raise
 
 
 async def async_upload_bytes_to_gcs(blob_name: str, data: bytes, content_type: str = "application/pdf") -> str:
@@ -287,14 +287,29 @@ async def transcribe_audio_bytes(
             if response.status_code == 200:
                 result   = response.json()
                 full_text = result.get("text", "").strip()
-                segments  = _parse_diarized_segments(result.get("words", []))
-                return {"full_text": full_text, "segments": segments}
+                words     = result.get("words", [])
+                segments  = _parse_diarized_segments(words)
+                
+                # Fallback to single segment if diarization yielded nothing but text exists
+                if not segments and full_text:
+                    segments = [{"speaker_id": "speaker_0", "text": full_text, "start_time": 0.0, "end_time": words[-1].get("end", 0.0) if words else 0.0}]
+
+                # Retrieve or calculate audio duration
+                audio_duration = result.get("audio_duration_secs")
+                if not audio_duration and words:
+                    audio_duration = words[-1].get("end")
+                
+                return {
+                    "full_text": full_text,
+                    "segments": segments,
+                    "audio_duration_secs": audio_duration
+                }
             else:
                 logger.warning(f"ElevenLabs STT failed {response.status_code}: {response.text[:200]}")
         except Exception as e:
             logger.warning(f"ElevenLabs STT error: {e}")
 
-    return {"full_text": "", "segments": []}
+    return {"full_text": "", "segments": [], "audio_duration_secs": 0.0}
 
 
 async def transcribe_audio(gcs_uri: str) -> dict[str, Any]:
@@ -330,16 +345,8 @@ async def parse_medical_document(gcs_uri: str, mime_type: str = "application/pdf
         result = client.process_document(request=request)
         return result.document.text
     except Exception as e:
-        logger.warning(f"Document AI failed, returning mock OCR: {e}")
-        return (
-            "PATIENT LAB REPORT - METROPOLIS HEALTHCARE\n"
-            "Patient: Ramesh Kumar, Age: 45, Gender: Male\n"
-            "Date: 2026-06-25\n"
-            "TEST: Complete Blood Count (CBC)\n"
-            "Hemoglobin: 14.2 g/dL (Normal: 13.0 - 17.0)\n"
-            "WBC Count: 11,500 /uL (HIGH, Normal: 4,000 - 11,000)\n"
-            "HbA1c: 6.8% (HIGH, Prediabetic range: > 5.7%)\n"
-        )
+        logger.error(f"Document AI failed: {e}")
+        raise
 
 
 # ══════════════════════════════════════════════════════════════
@@ -434,41 +441,64 @@ def synthesize_speech(text: str, language_code: str = "hi-IN") -> bytes:
 # ══════════════════════════════════════════════════════════════
 def generate_gemini_content(prompt: str, json_response: bool = False, model: str | None = None) -> str:
     """Generates text via Gemini model (sync — use async_generate_gemini_content in async contexts)."""
-    try:
-        client = _get_genai()
-        config = None
-        if json_response:
-            config = genai_types.GenerateContentConfig(
-                response_mime_type="application/json",
-            )
-
-        model_name = model or settings.GEMINI_MODEL
-        response = client.models.generate_content(
-            model=model_name,
-            contents=prompt,
-            config=config,
+    client = _get_genai()
+    config = None
+    if json_response:
+        config = genai_types.GenerateContentConfig(
+            response_mime_type="application/json",
         )
-        return response.text
+    model_name = model or settings.GEMINI_MODEL
+    response = client.models.generate_content(
+        model=model_name,
+        contents=prompt,
+        config=config,
+    )
+    return response.text
 
-    except Exception as e:
-        logger.warning(f"Gemini failed, returning mock: {e}")
-        if json_response:
-            return json.dumps({
-                "category": "lab_report",
-                "summary": "Mock summary: Your report shows a high WBC count which may indicate infection. Please consult your doctor.",
-                "doctor_name": None,
-                "document_date": None,
-                "medications": [],
-                "abnormal_labs": [{"parameter_name": "WBC Count", "value": "11,500 /uL", "reference_range": "4,000 - 11,000", "status": "High"}],
-                "red_flags": [],
-                "actionable_steps": ["Consult your doctor about the elevated WBC count."]
-            })
-        return "Mock AI summary of your consultation."
+
+def generate_gemini_content_with_usage(
+    prompt: str,
+    json_response: bool = False,
+    model: str | None = None,
+) -> tuple[str, dict]:
+    """Like generate_gemini_content but also returns token usage for eval logging.
+
+    Returns (text, {"prompt_token_count": int, "candidates_token_count": int}).
+    Gemini Flash pricing: $0.075/1M input tokens, $0.30/1M output tokens.
+    """
+    client = _get_genai()
+    config = None
+    if json_response:
+        config = genai_types.GenerateContentConfig(
+            response_mime_type="application/json",
+        )
+    model_name = model or settings.GEMINI_MODEL
+    response = client.models.generate_content(
+        model=model_name,
+        contents=prompt,
+        config=config,
+    )
+    usage: dict = {}
+    if response.usage_metadata:
+        usage = {
+            "prompt_token_count":     response.usage_metadata.prompt_token_count or 0,
+            "candidates_token_count": response.usage_metadata.candidates_token_count or 0,
+        }
+    return response.text, usage
 
 
 async def async_generate_gemini_content(prompt: str, json_response: bool = False, model: str | None = None) -> str:
     """Non-blocking Gemini call — wraps the sync call in a thread pool."""
     return await asyncio.to_thread(generate_gemini_content, prompt, json_response, model)
+
+
+async def async_generate_gemini_content_with_usage(
+    prompt: str,
+    json_response: bool = False,
+    model: str | None = None,
+) -> tuple[str, dict]:
+    """Non-blocking Gemini call that also returns token usage."""
+    return await asyncio.to_thread(generate_gemini_content_with_usage, prompt, json_response, model)
 
 
 async def stream_gemini_content(prompt: str, model: str | None = None):

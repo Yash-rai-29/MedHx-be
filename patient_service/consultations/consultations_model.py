@@ -108,6 +108,21 @@ class AudioConsultationListItem(BaseModel):
     created_at:     datetime
 
 
+class ConsultationEvalMetrics(BaseModel):
+    """Processing performance and cost metrics for a completed consultation."""
+    stt_duration_s:           Optional[float] = Field(None, description="ElevenLabs STT wall-clock time in seconds")
+    extraction_duration_s:    Optional[float] = Field(None, description="Gemini extraction wall-clock time in seconds")
+    total_duration_s:         Optional[float] = Field(None, description="Total background processing time in seconds")
+    gemini_input_tokens:      Optional[int]   = Field(None, description="Gemini prompt token count")
+    gemini_output_tokens:     Optional[int]   = Field(None, description="Gemini output token count")
+    estimated_cost_usd:       Optional[float] = Field(None, description="Estimated Gemini API cost in USD")
+    stt_cost_usd:             Optional[float] = Field(None, description="Estimated STT API cost in USD")
+    estimated_cost_inr:       Optional[float] = Field(None, description="Estimated total cost in INR (Gemini + STT)")
+    hallucinated_dropped:     Optional[int]   = Field(None, description="Suggestions dropped by hallucination guard")
+    safety_warnings:          Optional[int]   = Field(None, description="Medicine safety warnings raised")
+
+
+
 class AudioConsultationResponse(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 

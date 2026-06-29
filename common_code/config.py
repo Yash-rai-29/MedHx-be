@@ -64,6 +64,11 @@ class Settings(BaseSettings):
     CLOUD_TASKS_SECRET: Optional[str] = "local-tasks-secret"
     SERVICE_URL: Optional[str] = None
 
+    # ── CORS ──────────────────────────────────────────────────
+    # Space-separated list of allowed origins. Override via env var in Cloud Run.
+    # Example: "https://medhx.web.app https://medhx.firebaseapp.com"
+    ALLOWED_ORIGINS: str = "http://localhost:3000 http://localhost:8080"
+
     # ── ElevenLabs ────────────────────────────────────────────
     ELEVENLABS_API_KEY: Optional[str] = None
     # Fallback voice ID used when a language is not in ELEVENLABS_VOICE_ID_MAP (gcp_clients.py)

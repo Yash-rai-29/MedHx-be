@@ -10,6 +10,7 @@ from patient_service.consultations.consultations_model import (
     AudioConsultationListItem,
     AudioConsultationResponse,
     AudioConsultationUploadResponse,
+    ConsultationEvalMetrics,
     DeleteAudioConsultationResponse,
     PatientConsultationDetail,
     RefineConsultationRequest,
@@ -26,6 +27,7 @@ from patient_service.consultations.consultations_func import (
     delete_audio_consultation,
     get_audio_consultation,
     get_audio_consultations,
+    get_consultation_eval,
     listen_audio_consultation_summary,
     refine_consultation,
     upload_audio_consultation,
@@ -133,6 +135,23 @@ async def get_audio_consultation_endpoint(
     """Gets a single audio consultation by ID. Poll until status = completed."""
     try:
         return await get_audio_consultation(current_user["uid"], consultation_id, db)
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/audio/{consultation_id}/eval", response_model=ConsultationEvalMetrics)
+async def get_audio_consultation_eval(
+    consultation_id: str,
+    current_user: dict = Depends(patient_gate),
+    db: firestore.AsyncClient = Depends(get_db),
+):
+    """Returns processing performance and cost metrics for a completed audio consultation."""
+    try:
+        return await get_consultation_eval(current_user["uid"], consultation_id, db)
     except PermissionError as e:
         raise HTTPException(status_code=403, detail=str(e))
     except ValueError as e:

@@ -1,9 +1,11 @@
 import asyncio
 import json
 import logging
+import time
 import uuid
 from datetime import datetime, UTC
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 from google.cloud import firestore
 
@@ -12,6 +14,7 @@ from common_code.notification_dispatcher import dispatch_notification
 from common_code.pii_masker import mask_pii
 from common_code.gcp_clients import (
     async_generate_gemini_content,
+    async_generate_gemini_content_with_usage,
     async_upload_bytes_to_gcs,
     async_download_bytes_from_gcs,
     async_delete_gcs_prefix,
@@ -27,6 +30,7 @@ from patient_service.consultations.consultations_model import (
     AudioConsultationResponse,
     AudioConsultationStatus,
     AudioConsultationUploadResponse,
+    ConsultationEvalMetrics,
     DiarizedSegment,
     ExtractedMedicine,
     ICDCode,
@@ -384,9 +388,14 @@ async def background_process_audio_consultation(
     doc_ref = db.collection(_COLL).document(consultation_id)
     await doc_ref.update({"status": AudioConsultationStatus.in_progress.value})
 
+    process_start = time.monotonic()
+
     try:
-        # ── 1. Transcribe (ElevenLabs STT first, GCP fallback) ──
+        # ── 1. Transcribe (ElevenLabs STT) ───────────────────────────────────
+        stt_start     = time.monotonic()
         transcription = await transcribe_audio(gcs_uri)
+        stt_duration  = time.monotonic() - stt_start
+
         transcript   = transcription.get("full_text", "")
         raw_segments = transcription.get("segments", [])
 
@@ -398,7 +407,7 @@ async def background_process_audio_consultation(
             return
 
         # ── 1b. Mask PII before any LLM call ────────────────────────────────
-        pii_result       = mask_pii(transcript)
+        pii_result        = mask_pii(transcript)
         masked_transcript = pii_result.masked_text
         pii_map           = pii_result.replacement_map
         if pii_map:
@@ -410,7 +419,7 @@ async def background_process_audio_consultation(
             _generate_consultation_title(masked_transcript, language),
         )
 
-        # Build enriched segments: attach named role to each speaker segment
+        # Build enriched segments with named roles
         enriched_segments = [
             {
                 "speaker_id": s.get("speaker_id"),
@@ -423,9 +432,19 @@ async def background_process_audio_consultation(
             if s.get("text", "").strip()
         ]
 
-        # ── 2. Gemini extraction (masked transcript) ─────────────────────────
-        prompt   = _extraction_prompt(masked_transcript, LANGUAGE_DISPLAY_NAMES.get(language, "English"))
-        raw_json = await async_generate_gemini_content(prompt, json_response=True)
+        # ── 2. Gemini extraction (masked transcript, capture token usage) ────
+        extraction_start = time.monotonic()
+        prompt           = _extraction_prompt(masked_transcript, LANGUAGE_DISPLAY_NAMES.get(language, "English"))
+        raw_json, gemini_usage = await async_generate_gemini_content_with_usage(prompt, json_response=True)
+        extraction_duration    = time.monotonic() - extraction_start
+
+        gemini_input_tokens  = gemini_usage.get("prompt_token_count", 0)
+        gemini_output_tokens = gemini_usage.get("candidates_token_count", 0)
+        # Gemini 2.5 Flash pricing: $0.075/1M input, $0.30/1M output
+        estimated_cost_usd = (
+            (gemini_input_tokens / 1_000_000) * 0.075
+            + (gemini_output_tokens / 1_000_000) * 0.30
+        )
 
         try:
             extracted = json.loads(raw_json)
@@ -433,7 +452,7 @@ async def background_process_audio_consultation(
             logger.warning(f"[{consultation_id}] Gemini returned non-JSON: {raw_json[:200]}")
             await doc_ref.update({
                 "status":        AudioConsultationStatus.failed.value,
-                "transcript":    transcript,   # store original, not masked
+                "transcript":    transcript,
                 "pii_map":       pii_map,
                 "error_message": "Clinical extraction failed — AI returned an unreadable response. Please try again.",
             })
@@ -443,6 +462,9 @@ async def background_process_audio_consultation(
         doctor_name = extracted.get("doctor_name")
         is_medical  = bool(extracted.get("is_medical_consultation", True))
 
+        hallucinated_dropped = 0
+        safety_warnings      = 0
+
         if not is_medical:
             logger.info(f"[{consultation_id}] Gemini flagged as non-medical — skipping clinical extraction.")
             key_diagnoses = []
@@ -450,35 +472,104 @@ async def background_process_audio_consultation(
             medicines     = []
             suggestions   = []
         else:
-            key_diagnoses = extracted.get("key_diagnoses") or []
+            transcript_lower = transcript.lower()
 
-            # Parse ICD codes — validate structure, drop malformed entries
+            # ── Diagnoses — word-match guard against transcript ───────────────
+            raw_diagnoses = extracted.get("key_diagnoses") or []
+            key_diagnoses = []
+            for dx in raw_diagnoses:
+                if not isinstance(dx, str):
+                    continue
+                words = [w for w in dx.lower().split() if len(w) >= 4]
+                if words and not any(w in transcript_lower for w in words):
+                    logger.info(f"[{consultation_id}] Dropping hallucinated diagnosis: {dx!r}")
+                    hallucinated_dropped += 1
+                else:
+                    key_diagnoses.append(dx)
+
+            # ── ICD codes — description must match transcript or a kept diagnosis ─
+            diagnoses_lower = " ".join(key_diagnoses).lower()
             icd_codes = []
             for item in (extracted.get("icd_codes") or []):
-                if isinstance(item, dict) and item.get("code") and item.get("description"):
+                if not isinstance(item, dict) or not item.get("code") or not item.get("description"):
+                    continue
+                desc_words = [w for w in item["description"].lower().split() if len(w) >= 4]
+                if desc_words and not any(
+                    w in transcript_lower or w in diagnoses_lower for w in desc_words
+                ):
+                    logger.info(f"[{consultation_id}] Dropping hallucinated ICD code: {item['code']}")
+                    hallucinated_dropped += 1
+                else:
                     icd_codes.append({"code": item["code"], "description": item["description"]})
 
             medicines = [m for m in (extracted.get("medicines") or []) if isinstance(m, dict) and m.get("name")]
             raw_sugg  = [s for s in (extracted.get("reminder_suggestions") or []) if isinstance(s, dict) and s.get("title")]
 
-            # Secondary guard: drop medicine suggestions whose name does not appear in the
-            # original transcript — catches hallucinations from the masked version.
-            transcript_lower = transcript.lower()
+            # ── Medicine suggestion guard — name must appear in transcript ────
             suggestions = []
             for s in raw_sugg:
                 if s.get("type") == "medicine":
                     med_name = (s.get("medicine_details") or {}).get("name") or s.get("title", "")
-                    words = [w for w in med_name.lower().split() if len(w) >= 4]
+                    words    = [w for w in med_name.lower().split() if len(w) >= 4]
                     if words and not any(w in transcript_lower for w in words):
                         logger.info(f"[{consultation_id}] Dropping hallucinated medicine suggestion: {med_name}")
+                        hallucinated_dropped += 1
                         continue
                 suggestions.append(s)
 
-        # ── 3. Persist — store ORIGINAL transcript (PII intact) ───────────────
+            # ── Resolve start_date / end_date on medicine suggestions ─────────
+            suggestions = _resolve_suggestion_dates(suggestions)
+
+            # ── Safety checks — allergy, drug interactions, dosing ────────────
+            if medicines:
+                try:
+                    from common_code.safety_engine import run_safety_checks
+                    profile_snap    = await db.collection(settings.PATIENTS_COLLECTION).document(uid).get()
+                    patient_profile = profile_snap.to_dict() if profile_snap.exists else {}
+                    safety_result   = await run_safety_checks(
+                        db=db,
+                        patient_id=uid,
+                        prescribed_medicines=medicines,
+                        patient_profile=patient_profile,
+                    )
+                    all_warnings = (
+                        safety_result.get("setup_warnings", [])
+                        + safety_result.get("allergy_conflicts", [])
+                        + safety_result.get("drug_interactions", [])
+                        + safety_result.get("duplicate_therapies", [])
+                        + safety_result.get("dosing_warnings", [])
+                    )
+                    safety_warnings = len(all_warnings)
+                    if safety_warnings:
+                        logger.warning(
+                            f"[{consultation_id}] {safety_warnings} safety warning(s): "
+                            + str(all_warnings)[:400]
+                        )
+                except Exception as se:
+                    logger.warning(f"[{consultation_id}] Safety check failed (non-blocking): {se}")
+
+        # Calculate STT Cost (ElevenLabs Scribe v2 pricing: $0.01/min -> $0.000167/sec)
+        audio_duration_secs = transcription.get("audio_duration_secs") or 0.0
+        stt_cost_usd = audio_duration_secs * (0.01 / 60.0)
+
+        # Calculate Total Cost in INR (using exchange rate 1 USD = 94 INR)
+        total_cost_usd = estimated_cost_usd + stt_cost_usd
+        estimated_cost_inr = total_cost_usd * 94.0
+
+        total_duration = time.monotonic() - process_start
+        logger.info(
+            f"[{consultation_id}] processed in {total_duration:.1f}s "
+            f"(STT {stt_duration:.1f}s, extraction {extraction_duration:.1f}s) "
+            f"tokens={gemini_input_tokens}+{gemini_output_tokens} "
+            f"cost=${estimated_cost_usd:.5f} (STT cost=${stt_cost_usd:.5f}, INR total=₹{estimated_cost_inr:.4f}) "
+            f"dropped={hallucinated_dropped}"
+        )
+
+        # ── 3. Persist — store ORIGINAL transcript (PII intact) ──────────────
         update: dict = {
             "status":               AudioConsultationStatus.completed.value,
-            "transcript":           transcript,       # original, PII present — stored in patient's own doc
-            "pii_map":              pii_map,          # placeholder→original map for audit
+            "transcript":           transcript,
+            "pii_map":              pii_map,
             "segments":             enriched_segments,
             "summary":              summary,
             "doctor_name":          doctor_name,
@@ -491,6 +582,21 @@ async def background_process_audio_consultation(
         if consultation_title:
             update["title"] = consultation_title
         await doc_ref.update(update)
+
+        # Store Eval metrics in a sub-collection "evals" inside the document under "metrics"
+        eval_metrics_dict = {
+            "stt_duration_s":        round(stt_duration, 2),
+            "extraction_duration_s": round(extraction_duration, 2),
+            "total_duration_s":      round(total_duration, 2),
+            "gemini_input_tokens":   gemini_input_tokens,
+            "gemini_output_tokens":  gemini_output_tokens,
+            "estimated_cost_usd":    round(estimated_cost_usd, 6),
+            "stt_cost_usd":          round(stt_cost_usd, 6),
+            "estimated_cost_inr":    round(estimated_cost_inr, 4),
+            "hallucinated_dropped":  hallucinated_dropped,
+            "safety_warnings":       safety_warnings,
+        }
+        await doc_ref.collection("evals").document("metrics").set(eval_metrics_dict)
         logger.info(f"Audio consultation {consultation_id} processed successfully.")
 
         # Build a specific body from the extracted data we already have
@@ -577,6 +683,96 @@ def _parse_suggestions(raw: list) -> list[ReminderSuggestion]:
     return out
 
 
+# Approximate IST clock times for each meal_timing value.
+# Used to decide whether today's dose has already passed when resolving start_date.
+_MEAL_TIMING_TIMES: dict[str, tuple[int, int]] = {
+    "before_breakfast": (8,   0),
+    "after_breakfast":  (9,  30),
+    "before_lunch":     (13,  0),
+    "after_lunch":      (14,  0),
+    "before_dinner":    (19, 30),
+    "after_dinner":     (21,  0),
+    "specific_time":    (9,   0),  # fallback; overridden by time_of_day when present
+}
+
+_IST = ZoneInfo("Asia/Kolkata")
+
+
+def _resolve_suggestion_dates(suggestions: list[dict]) -> list[dict]:
+    """Fill in start_date and end_date on medicine reminder suggestion dicts.
+
+    This runs on the raw dicts before they are written to Firestore so that the
+    dates are persisted correctly. (The ReminderSchedule Pydantic validator runs
+    only during GET / parse, which is too late to save the computed dates.)
+
+    Logic:
+    - start_date: today (IST) if the dose time has not yet passed, else tomorrow.
+    - end_date:   start_date + (duration_days − 1) if a day/week/month count is
+                  present in medicine_details.duration; omitted for "ongoing".
+    """
+    import re
+    from datetime import date, timedelta
+
+    now_ist   = datetime.now(_IST)
+    today_ist = now_ist.date()
+
+    def _parse_reminder_hour_minute(sched: dict) -> tuple[int, int]:
+        """Return (hour, minute) IST for the scheduled dose."""
+        tod = (sched.get("time_of_day") or "").strip()
+        if tod and ":" in tod:
+            try:
+                h, m = map(int, tod.split(":")[:2])
+                return h, m
+            except ValueError:
+                pass
+        mt = sched.get("meal_timing") or ""
+        return _MEAL_TIMING_TIMES.get(mt, (9, 0))
+
+    def _parse_duration_days(duration_str: str) -> int | None:
+        """Return total days from strings like '2 days', '1 week', '3 months'."""
+        s = (duration_str or "").lower().strip()
+        if not s or any(kw in s for kw in ("ongoing", "indefinite", "chronic", "long")):
+            return None
+        m = re.search(r"(\d+)\s*(day|week|month)", s)
+        if not m:
+            return None
+        n    = int(m.group(1))
+        unit = m.group(2)
+        if unit == "week":
+            return n * 7
+        if unit == "month":
+            return n * 30
+        return n  # days
+
+    for s in suggestions:
+        if s.get("type") != "medicine":
+            continue
+        sched = s.get("schedule")
+        if not isinstance(sched, dict):
+            continue
+        if sched.get("start_date") is not None:
+            continue  # already resolved — don't overwrite
+
+        h, m       = _parse_reminder_hour_minute(sched)
+        dose_mins  = h * 60 + m
+        now_mins   = now_ist.hour * 60 + now_ist.minute
+        start_date: date = today_ist if now_mins < dose_mins else today_ist + timedelta(days=1)
+
+        sched["start_date"] = start_date.isoformat()
+
+        duration_str = ((s.get("medicine_details") or {}).get("duration") or "").strip()
+        duration_days = _parse_duration_days(duration_str)
+        if duration_days is not None:
+            # end_date is the last day the patient should take the medicine.
+            # start_date counts as day 1, so end_date = start_date + duration_days - 1.
+            end_date = start_date + timedelta(days=duration_days - 1)
+            sched["end_date"] = end_date.isoformat()
+
+        s["schedule"] = sched
+
+    return suggestions
+
+
 async def _to_response(doc_id: str, d: dict, db: firestore.AsyncClient) -> AudioConsultationResponse:
     raw_lang = d.get("language", "en")
     try:
@@ -628,7 +824,7 @@ async def _to_response(doc_id: str, d: dict, db: firestore.AsyncClient) -> Audio
         file_path=d.get("file_path", ""),
         title=d.get("title"),
         language=language,
-        transcript=d.get("transcript"),   # original transcript with PII — served only to the patient (auth required)
+        transcript=d.get("transcript"),
         segments=segments,
         medicines=[ExtractedMedicine(**m) for m in raw_medicines if m.get("name")] if raw_medicines is not None else None,
         reminder_suggestions=_parse_suggestions(raw_suggestions) if raw_suggestions is not None else None,
@@ -710,6 +906,57 @@ async def get_audio_consultation(
     return await _to_response(snap.id, d, db)
 
 
+async def get_consultation_eval(
+    uid: str,
+    consultation_id: str,
+    db: firestore.AsyncClient,
+) -> ConsultationEvalMetrics:
+    snap = await db.collection(_COLL).document(consultation_id).get()
+    if not snap.exists:
+        raise ValueError("Audio consultation not found.")
+    d = snap.to_dict()
+    if d.get("patientId") != uid:
+        raise PermissionError("Access is unauthorized.")
+
+    eval_ref = db.collection(_COLL).document(consultation_id).collection("evals").document("metrics")
+    eval_snap = await eval_ref.get()
+    if eval_snap.exists:
+        ed = eval_snap.to_dict() or {}
+        return ConsultationEvalMetrics(
+            stt_duration_s=ed.get("stt_duration_s"),
+            extraction_duration_s=ed.get("extraction_duration_s"),
+            total_duration_s=ed.get("total_duration_s"),
+            gemini_input_tokens=ed.get("gemini_input_tokens"),
+            gemini_output_tokens=ed.get("gemini_output_tokens"),
+            estimated_cost_usd=ed.get("estimated_cost_usd"),
+            stt_cost_usd=ed.get("stt_cost_usd"),
+            estimated_cost_inr=ed.get("estimated_cost_inr"),
+            hallucinated_dropped=ed.get("hallucinated_dropped"),
+            safety_warnings=ed.get("safety_warnings"),
+        )
+    else:
+        # Fallback to main document fields for backwards-compatibility
+        _eval_keys = (
+            "stt_duration_s", "extraction_duration_s", "total_duration_s",
+            "gemini_input_tokens", "gemini_output_tokens", "estimated_cost_usd",
+            "hallucinated_dropped", "safety_warnings",
+        )
+        if not any(k in d for k in _eval_keys):
+            raise ValueError("Eval metrics are not available yet — consultation may still be processing.")
+        return ConsultationEvalMetrics(
+            stt_duration_s=d.get("stt_duration_s"),
+            extraction_duration_s=d.get("extraction_duration_s"),
+            total_duration_s=d.get("total_duration_s"),
+            gemini_input_tokens=d.get("gemini_input_tokens"),
+            gemini_output_tokens=d.get("gemini_output_tokens"),
+            estimated_cost_usd=d.get("estimated_cost_usd"),
+            stt_cost_usd=d.get("stt_cost_usd"),
+            estimated_cost_inr=d.get("estimated_cost_inr"),
+            hallucinated_dropped=d.get("hallucinated_dropped"),
+            safety_warnings=d.get("safety_warnings"),
+        )
+
+
 async def delete_audio_consultation(
     uid: str,
     consultation_id: str,
@@ -731,6 +978,12 @@ async def delete_audio_consultation(
             )
         except Exception as e:
             logger.warning(f"GCS delete failed for {blob_name}: {e}")
+
+    # Delete evals/metrics sub-collection document if exists
+    try:
+        await db.collection(_COLL).document(consultation_id).collection("evals").document("metrics").delete()
+    except Exception as e:
+        logger.warning(f"Failed to delete evals/metrics for {consultation_id}: {e}")
 
     await db.collection(_COLL).document(consultation_id).delete()
 

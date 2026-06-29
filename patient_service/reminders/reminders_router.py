@@ -1,7 +1,8 @@
+from datetime import datetime as _datetime
+from zoneinfo import ZoneInfo
 import base64
 import json
 import logging
-
 from fastapi import APIRouter, Depends, HTTPException, status, Header, Query
 from google.cloud import firestore
 from typing import List, Optional
@@ -239,9 +240,7 @@ async def pubsub_handler(
     if not suggestions:
         return {"status": "ok", "created": 0}
 
-    from datetime import date as _date
-
-    today = _date.today()
+    today = _datetime.now(ZoneInfo("Asia/Kolkata")).date()
     reqs  = []
     for s in suggestions:
         try:

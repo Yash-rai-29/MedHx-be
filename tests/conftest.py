@@ -42,14 +42,16 @@ class MockDocumentSnapshot:
         return self._data or {}
 
 class MockDocumentReference:
-    def __init__(self, doc_id, collection_store):
+    def __init__(self, doc_id, collection_store, path=None, db_store=None):
         self.id = doc_id
         self.collection_store = collection_store
+        self.path = path or f"docs/{doc_id}"
+        self.db_store = db_store if db_store is not None else {}
 
     async def set(self, data):
         self.collection_store[self.id] = data
 
-    async def get(self):
+    async def get(self, transaction=None):
         data = self.collection_store.get(self.id)
         return MockDocumentSnapshot(self.id, data)
 
@@ -66,6 +68,10 @@ class MockDocumentReference:
                     target[part] = {}
                 target = target[part]
             target[parts[-1]] = value
+
+    def collection(self, col_name):
+        sub_coll_path = f"{self.path}/{col_name}"
+        return MockCollectionReference(sub_coll_path, self.db_store)
 
 class MockQuery:
     def __init__(self, collection_store, filters=None):
@@ -162,6 +168,9 @@ class MockQuery:
 
         return results
 
+    def select(self, fields):
+        return self
+
 class MockCollectionReference:
     def __init__(self, name, db_store):
         self.name = name
@@ -173,14 +182,20 @@ class MockCollectionReference:
     def store(self):
         return self.db_store[self.name]
 
-    def document(self, doc_id):
-        return MockDocumentReference(doc_id, self.store)
+    def document(self, doc_id=None):
+        if doc_id is None:
+            import uuid
+            doc_id = str(uuid.uuid4())
+        return MockDocumentReference(doc_id, self.store, f"{self.name}/{doc_id}", self.db_store)
 
     def where(self, field, op, value):
         return MockQuery(self.store).where(field, op, value)
 
     def limit(self, value):
         return MockQuery(self.store).limit(value)
+
+    def select(self, fields):
+        return MockQuery(self.store).select(fields)
 
     async def get(self):
         return await MockQuery(self.store).get()
@@ -189,7 +204,7 @@ class MockCollectionReference:
         import uuid
         doc_id = str(uuid.uuid4())
         self.store[doc_id] = data
-        ref = MockDocumentReference(doc_id, self.store)
+        ref = MockDocumentReference(doc_id, self.store, f"{self.name}/{doc_id}", self.db_store)
         return None, ref
 
 class MockWriteBatch:
@@ -226,6 +241,29 @@ class MockWriteBatch:
                 if doc_ref.id in doc_ref.collection_store:
                     del doc_ref.collection_store[doc_ref.id]
 
+class MockTransaction:
+    async def get(self, doc_ref):
+        return await doc_ref.get()
+
+    def update(self, doc_ref, data):
+        doc = doc_ref.collection_store.get(doc_ref.id)
+        if doc is None:
+            doc = {}
+            doc_ref.collection_store[doc_ref.id] = doc
+        for key, value in data.items():
+            # Support firestore.Increment
+            if hasattr(value, "value"):
+                current_val = doc.get(key, 0)
+                doc[key] = current_val + value.value
+            else:
+                parts = key.split(".")
+                target = doc
+                for part in parts[:-1]:
+                    if part not in target or not isinstance(target[part], dict):
+                        target[part] = {}
+                    target = target[part]
+                target[parts[-1]] = value
+
 class MockFirestoreClient:
     def __init__(self):
         self.db_store = {}
@@ -235,6 +273,13 @@ class MockFirestoreClient:
 
     def batch(self):
         return MockWriteBatch(self.db_store)
+
+    def transaction(self):
+        return MockTransaction()
+
+# Globally bypass Firestore transactional decorators in tests
+import google.cloud.firestore
+google.cloud.firestore.async_transactional = lambda f: f
 
 # ── Pytest Fixtures ──────────────────────────────────────────
 @pytest.fixture

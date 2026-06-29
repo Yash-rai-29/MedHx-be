@@ -6,6 +6,7 @@ import logging
 from typing import Optional
 from google.cloud import firestore
 from common_code.config import settings
+from common_code.pii_masker import mask_pii
 from common_code.gcp_clients import (
     upload_bytes_to_gcs,
     async_upload_bytes_to_gcs,
@@ -321,6 +322,13 @@ async def background_parse_and_index_document(
             })
             return
 
+        # Strip PII from OCR text before sending to Gemini (phone, Aadhaar, email, PAN, DOB).
+        # The original raw_text (with PII) is still stored in Firestore — this is the patient's own record.
+        pii_result   = mask_pii(raw_text)
+        masked_text  = pii_result.masked_text
+        if pii_result.replacement_map:
+            logger.info(f"[doc:{doc_id}] Masked {len(pii_result.replacement_map)} PII token(s) before Gemini call.")
+
         # Incorporate user-provided context if present — delimited so it cannot alter prompt instructions
         context_str = ""
         if title or description:
@@ -383,7 +391,7 @@ async def background_parse_and_index_document(
             "  \"actionable_steps\": [\"...\"]\n"
             "}\n\n"
             f"{context_str}"
-            f"Document Text:\n{raw_text}"
+            f"Document Text:\n{masked_text}"
         )
 
         gemini_output = await async_generate_gemini_content(prompt, json_response=True)
