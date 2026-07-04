@@ -8,6 +8,7 @@ from enum import Enum
 
 class NotificationType(str, Enum):
     medicine            = "medicine"
+    follow_up           = "follow_up"
     consultation        = "consultation"
     audio_consultation  = "audio_consultation"
     report              = "report"

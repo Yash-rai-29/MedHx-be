@@ -27,7 +27,7 @@ def create_app() -> FastAPI:
     allowed_origins = [o.strip() for o in settings.ALLOWED_ORIGINS.split() if o.strip()]
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=allowed_origins,
+        allow_origins="*",
         allow_credentials=True,
         allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
         allow_headers=["Authorization", "Content-Type", "X-Cloud-Tasks-Secret"],

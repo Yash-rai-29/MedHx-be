@@ -297,3 +297,31 @@ async def test_notification_templates_and_formatting(client, mock_db, mock_user)
         assert latest_notif["body"] == "Your request for Blood Report is approved. Code: {missing_code}"
         assert latest_notif["deeplink"] == "/"
 
+
+def test_invalid_notification_type_fallback(client, mock_db, mock_user):
+    """Verify that if a database record has an invalid or unknown notification type, it is parsed as general and returned without crashing."""
+    mock_db.db_store[settings.NOTIFICATIONS_COLLECTION] = {
+        "notif-invalid": {
+            "patientId": mock_user["uid"],
+            "title": "Invalid Type Alert",
+            "body": "This notification has an unknown category.",
+            "deeplink": None,
+            "isRead": False,
+            "createdAt": datetime.datetime.now(datetime.UTC),
+            "type": "some_unknown_type_xyz",
+            "extraData": {},
+            "pushStatus": "sent",
+            "pushMessageId": "msg-987"
+        }
+    }
+    response = client.get("/notifications")
+    assert response.status_code == 200
+    data = response.json()
+    assert "notifications" in data
+    notifications = data["notifications"]
+    assert len(notifications) == 1
+    assert notifications[0]["id"] == "notif-invalid"
+    # Verify fallback to general notification type
+    assert notifications[0]["type"] == "general"
+
+

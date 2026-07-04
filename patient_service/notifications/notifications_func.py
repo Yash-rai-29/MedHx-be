@@ -67,6 +67,13 @@ async def get_notifications(
     results: List[NotificationResponse] = []
     for doc in page_docs:
         data = doc.to_dict()
+        
+        raw_type = data.get("type")
+        try:
+            notification_type = NotificationType(raw_type)
+        except ValueError:
+            notification_type = NotificationType.general
+
         results.append(
             NotificationResponse(
                 id=doc.id,
@@ -76,7 +83,7 @@ async def get_notifications(
                 deeplink=data.get("deeplink"),
                 is_read=data.get("isRead", False),
                 created_at=data.get("createdAt"),
-                type=data.get("type", NotificationType.general),
+                type=notification_type,
                 extra_data=data.get("extraData", {}),
                 push_status=data.get("pushStatus", PushStatus.pending),
                 push_message_id=data.get("pushMessageId"),
