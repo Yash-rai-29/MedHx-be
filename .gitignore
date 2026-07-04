@@ -182,5 +182,7 @@ scripts/*
 !scripts/generate_legal_docs.py
 
 last_bearer_token.txt
-last_bearer_token.txt
 harsh_discharge_summary.pdf
+resources/
+tests/
+last_bearer_token.txt

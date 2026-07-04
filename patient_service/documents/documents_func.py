@@ -30,8 +30,26 @@ from patient_service.documents.documents_model import (
     AbnormalLabItem,
     TranslateSummaryResponse
 )
+from patient_service.consultations.consultations_model import ReminderSuggestion
 
 logger = logging.getLogger(__name__)
+
+_VALID_MEAL_TIMINGS = frozenset({
+    "before_breakfast", "after_breakfast",
+    "before_lunch",     "after_lunch",
+    "before_dinner",    "after_dinner",
+    "specific_time",
+})
+
+_MEAL_TIMING_TIMES: dict[str, tuple[int, int]] = {
+    "before_breakfast": (8,   0),
+    "after_breakfast":  (9,  30),
+    "before_lunch":     (13,  0),
+    "after_lunch":      (14,  0),
+    "before_dinner":    (19, 30),
+    "after_dinner":     (21,  0),
+    "specific_time":    (9,   0),
+}
 
 
 # ══════════════════════════════════════════════════════════════
@@ -156,6 +174,109 @@ def _coerce_abnormal_labs(raw: list) -> list[dict]:
     return result
 
 
+def _coerce_reminder_suggestions(raw: list) -> list[dict]:
+    """Validate and normalize Gemini reminder suggestions before writing to Firestore."""
+    result: list[dict] = []
+    seen_titles: set[str] = set()
+
+    for item in raw:
+        if not isinstance(item, dict) or not item.get("title"):
+            continue
+
+        schedule = item.get("schedule") or {}
+        if not isinstance(schedule, dict):
+            schedule = {}
+
+        meal_timing = schedule.get("meal_timing")
+        if isinstance(meal_timing, str):
+            normalized = meal_timing.strip().lower().replace(" ", "_")
+            schedule["meal_timing"] = normalized if normalized in _VALID_MEAL_TIMINGS else None
+        else:
+            schedule["meal_timing"] = None
+
+        schedule.setdefault("recurrence", "daily")
+        schedule.setdefault("time_of_day", "09:00")
+        schedule.setdefault("start_date", None)
+        schedule.setdefault("end_date", None)
+
+        payload = dict(item)
+        payload["schedule"] = schedule
+
+        title_key = str(payload.get("title", "")).strip().lower()
+        if not title_key or title_key in seen_titles:
+            continue
+
+        try:
+            suggestion = ReminderSuggestion(**payload)
+            result.append(suggestion.model_dump())
+            seen_titles.add(title_key)
+        except Exception as e:
+            logger.warning(f"Skipping malformed document reminder suggestion '{payload.get('title', '?')}': {e}")
+
+    return result
+
+
+def _resolve_suggestion_dates(suggestions: list[dict]) -> list[dict]:
+    """Resolve reminder start/end dates for extracted medicine suggestions."""
+    import re
+    from datetime import timedelta
+    from zoneinfo import ZoneInfo
+
+    now_ist = datetime.datetime.now(ZoneInfo("Asia/Kolkata"))
+    today_ist = now_ist.date()
+
+    def _parse_reminder_hour_minute(schedule: dict) -> tuple[int, int]:
+        time_of_day = str(schedule.get("time_of_day") or "").strip()
+        if ":" in time_of_day:
+            try:
+                hour, minute = map(int, time_of_day.split(":")[:2])
+                return hour, minute
+            except ValueError:
+                pass
+        meal_timing = schedule.get("meal_timing") or ""
+        return _MEAL_TIMING_TIMES.get(meal_timing, (9, 0))
+
+    def _parse_duration_days(duration_str: str | None) -> int | None:
+        s = (duration_str or "").lower().strip()
+        if not s or any(kw in s for kw in ("ongoing", "indefinite", "chronic", "long")):
+            return None
+        match = re.search(r"(\d+)\s*(day|week|month)", s)
+        if not match:
+            return None
+        n = int(match.group(1))
+        unit = match.group(2)
+        if unit == "week":
+            return n * 7
+        if unit == "month":
+            return n * 30
+        return n
+
+    for suggestion in suggestions:
+        if suggestion.get("type") != "medicine":
+            continue
+        schedule = suggestion.get("schedule")
+        if not isinstance(schedule, dict):
+            continue
+        if schedule.get("start_date") is not None:
+            continue
+
+        hour, minute = _parse_reminder_hour_minute(schedule)
+        dose_minutes = hour * 60 + minute
+        now_minutes = now_ist.hour * 60 + now_ist.minute
+        start_date = today_ist if now_minutes < dose_minutes else today_ist + timedelta(days=1)
+        schedule["start_date"] = start_date.isoformat()
+
+        duration_str = ((suggestion.get("medicine_details") or {}).get("duration") or "").strip()
+        duration_days = _parse_duration_days(duration_str)
+        if duration_days is not None:
+            end_date = start_date + timedelta(days=duration_days - 1)
+            schedule["end_date"] = end_date.isoformat()
+
+        suggestion["schedule"] = schedule
+
+    return suggestions
+
+
 def _names_match(extracted: str | None, profile: str | None) -> bool:
     """Returns True when extracted and profile names refer to the same person.
 
@@ -224,7 +345,8 @@ async def create_pending_document(
         "medications": [],
         "abnormal_labs": [],
         "red_flags": [],
-        "actionable_steps": []
+        "actionable_steps": [],
+        "reminder_suggestions": [],
     }
 
     await db.collection(settings.DOCUMENTS_COLLECTION).document(doc_id).set(doc_record)
@@ -257,7 +379,8 @@ async def create_pending_document(
         medications=[],
         abnormal_labs=[],
         red_flags=[],
-        actionable_steps=[]
+        actionable_steps=[],
+        reminder_suggestions=[],
     )
 
 async def upload_and_process_document(
@@ -375,6 +498,12 @@ async def background_parse_and_index_document(
             "   - red_flags: Warning symptoms in this document that require immediate emergency care (empty list if none).\n"
             "   - actionable_steps: Next steps, lifestyle changes, dietary restrictions, follow-up timelines.\n"
             "   - patient_name: Full name of the patient as written on the document (null if not found).\n"
+            "   - reminder_suggestions: ONLY for prescription documents. Return EXACTLY ONE reminder suggestion per distinct medicine name explicitly written in the document. "
+            "Use the exact consultation reminder structure below. If the document is not a prescription, return []. "
+            "Never invent medicines, timings, or follow-ups not clearly present in the document. "
+            "Use meal_timing only if one of: before_breakfast, after_breakfast, before_lunch, after_lunch, before_dinner, after_dinner, specific_time. "
+            "If timing is vague like 'after meals', set meal_timing to null and use a reasonable time_of_day. "
+            "Always set start_date and end_date to null; backend will resolve them.\n"
             f"{title_instruction}"
             f"{summary_lang_instruction}\n"
             "Return ONLY a valid JSON object with these exact keys (no markdown, no explanation):\n"
@@ -388,7 +517,29 @@ async def background_parse_and_index_document(
             "  \"medications\": [{\"name\": \"...\", \"dosage\": \"...\", \"frequency\": \"...\", \"instructions\": \"...\"}],\n"
             "  \"abnormal_labs\": [{\"parameter_name\": \"...\", \"value\": \"...\", \"reference_range\": \"...\", \"status\": \"...\"}],\n"
             "  \"red_flags\": [\"...\"],\n"
-            "  \"actionable_steps\": [\"...\"]\n"
+            "  \"actionable_steps\": [\"...\"],\n"
+            "  \"reminder_suggestions\": [\n"
+            "    {\n"
+            "      \"type\": \"medicine\",\n"
+            "      \"title\": \"<short reminder title>\",\n"
+            "      \"notes\": null,\n"
+            "      \"notification_enabled\": true,\n"
+            "      \"schedule\": {\n"
+            "        \"recurrence\": \"daily\",\n"
+            "        \"time_of_day\": \"09:00\",\n"
+            "        \"start_date\": null,\n"
+            "        \"end_date\": null,\n"
+            "        \"meal_timing\": null\n"
+            "      },\n"
+            "      \"medicine_details\": {\n"
+            "        \"name\": \"<exact medicine name>\",\n"
+            "        \"dosage\": \"<dosage or null>\",\n"
+            "        \"frequency\": \"<frequency or null>\",\n"
+            "        \"instructions\": \"<instructions or null>\"\n"
+            "      },\n"
+            "      \"follow_up_details\": null\n"
+            "    }\n"
+            "  ]\n"
             "}\n\n"
             f"{context_str}"
             f"Document Text:\n{masked_text}"
@@ -407,6 +558,7 @@ async def background_parse_and_index_document(
         abnormal_labs: list[dict] = []
         red_flags: list[str] = []
         actionable_steps: list[str] = []
+        reminder_suggestions: list[dict] = []
 
         _gemini_parse_ok = False
         try:
@@ -431,6 +583,7 @@ async def background_parse_and_index_document(
             abnormal_labs          = _coerce_abnormal_labs(parsed.get("abnormal_labs", []))
             red_flags              = [s for s in parsed.get("red_flags", []) if isinstance(s, str)]
             actionable_steps       = [s for s in parsed.get("actionable_steps", []) if isinstance(s, str)]
+            reminder_suggestions   = _coerce_reminder_suggestions(parsed.get("reminder_suggestions", []))
             _gemini_parse_ok       = True
         except (json.JSONDecodeError, ValueError, Exception) as je:
             logger.warning(f"[doc:{doc_id}] Failed to parse Gemini JSON: {je}. Raw output: {gemini_output[:200]}")
@@ -442,6 +595,22 @@ async def background_parse_and_index_document(
                 "failedAt": datetime.datetime.now(datetime.UTC),
             })
             return
+
+        ocr_text_lower = raw_text.lower()
+        if doc_type != DocumentType.prescription:
+            reminder_suggestions = []
+        else:
+            validated_suggestions: list[dict] = []
+            for suggestion in reminder_suggestions:
+                if suggestion.get("type") != "medicine":
+                    continue
+                med_name = ((suggestion.get("medicine_details") or {}).get("name") or suggestion.get("title") or "").strip()
+                words = [w for w in med_name.lower().split() if len(w) >= 4]
+                if words and not any(w in ocr_text_lower for w in words):
+                    logger.info(f"[doc:{doc_id}] Dropping hallucinated reminder suggestion: {med_name}")
+                    continue
+                validated_suggestions.append(suggestion)
+            reminder_suggestions = _resolve_suggestion_dates(validated_suggestions)
 
         # 3a. Collect processing warnings
         doc_warnings: list[str] = []
@@ -490,9 +659,10 @@ async def background_parse_and_index_document(
             "medications":           medications,
             "abnormal_labs":         abnormal_labs,
             "red_flags":             red_flags,
-            "actionable_steps": actionable_steps,
-            "warnings":         doc_warnings,
-            "processedAt":      datetime.datetime.now(datetime.UTC),
+            "actionable_steps":     actionable_steps,
+            "warnings":             doc_warnings,
+            "reminder_suggestions": reminder_suggestions,
+            "processedAt":          datetime.datetime.now(datetime.UTC),
         }
         if final_title is not None:
             update_payload["title"] = final_title
@@ -583,6 +753,7 @@ def _doc_to_response(doc_id: str, d: dict) -> DocumentResponse:
         red_flags=d.get("red_flags", []),
         actionable_steps=d.get("actionable_steps", []),
         warnings=d.get("warnings") or [],
+        reminder_suggestions=d.get("reminder_suggestions", []),
     )
 
 

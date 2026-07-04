@@ -3,8 +3,36 @@ from typing import List, Optional
 from datetime import datetime
 from enum import Enum
 
-from patient_service.documents.documents_model import SupportedLanguage
 from patient_service.reminders.reminders_model import ReminderCreateRequest
+
+
+class SupportedLanguage(str, Enum):
+    """Indian regional languages supported by both Gemini 2.5 Flash and ElevenLabs TTS."""
+    english   = "en"
+    hindi     = "hi"
+    tamil     = "ta"
+    telugu    = "te"
+    bengali   = "bn"
+    marathi   = "mr"
+    gujarati  = "gu"
+    kannada   = "kn"
+    malayalam = "ml"
+    punjabi   = "pa"
+
+
+# Maps language code → display name used in Gemini prompts
+LANGUAGE_DISPLAY_NAMES: dict[str, str] = {
+    "en": "English",
+    "hi": "Hindi",
+    "ta": "Tamil", 
+    "te": "Telugu",
+    "bn": "Bengali",
+    "mr": "Marathi",
+    "gu": "Gujarati",
+    "kn": "Kannada",
+    "ml": "Malayalam",
+    "pa": "Punjabi",
+}
 
 
 # ══════════════════════════════════════════════════════════════

@@ -1,3 +1,5 @@
+import json
+
 import pytest
 from unittest.mock import patch, AsyncMock
 from common_code.config import settings
@@ -112,3 +114,178 @@ def test_listen_document_summary(client, mock_db, mock_user, mock_gcp_services):
     response = client.get("/documents/doc-3/listen?lang=hi")
     assert response.status_code == 200
     assert response.content == b"MP3_BYTES_HERE"
+
+
+def test_upload_prescription_generates_reminder_suggestions(client, mock_db, mock_user, mock_gcp_services):
+    prescription_text = (
+        "Dr Mehta Prescription\n"
+        "Patient: Test User\n"
+        "Tab Metformin 500mg twice daily after meals for 5 days\n"
+        "Cap Dolo 650 once daily after breakfast for 3 days"
+    )
+    gemini_payload = {
+        "category": "prescription",
+        "summary": "This prescription contains two medicines and should be followed exactly as advised by your doctor.",
+        "doctor_name": "Dr Mehta",
+        "document_date": "2026-07-04",
+        "patient_name": "Test User",
+        "medications": [
+            {
+                "name": "Metformin",
+                "dosage": "500mg",
+                "frequency": "twice daily after meals",
+                "instructions": "after meals"
+            },
+            {
+                "name": "Dolo 650",
+                "dosage": "650mg",
+                "frequency": "once daily after breakfast",
+                "instructions": "after breakfast"
+            }
+        ],
+        "abnormal_labs": [],
+        "red_flags": [],
+        "actionable_steps": ["Take medicines exactly as prescribed."],
+        "reminder_suggestions": [
+            {
+                "type": "medicine",
+                "title": "Take Metformin",
+                "notes": None,
+                "notification_enabled": True,
+                "schedule": {
+                    "recurrence": "daily",
+                    "time_of_day": "09:00",
+                    "start_date": None,
+                    "end_date": None,
+                    "meal_timing": "after_meals"
+                },
+                "medicine_details": {
+                    "name": "Metformin",
+                    "dosage": "500mg",
+                    "frequency": "twice daily after meals",
+                    "instructions": "after meals"
+                },
+                "follow_up_details": None
+            },
+            {
+                "type": "medicine",
+                "title": "Take Dolo 650",
+                "notes": None,
+                "notification_enabled": True,
+                "schedule": {
+                    "recurrence": "daily",
+                    "time_of_day": "08:30",
+                    "start_date": None,
+                    "end_date": None,
+                    "meal_timing": "after_breakfast"
+                },
+                "medicine_details": {
+                    "name": "Dolo 650",
+                    "dosage": "650mg",
+                    "frequency": "once daily after breakfast",
+                    "instructions": "after breakfast"
+                },
+                "follow_up_details": None
+            }
+        ]
+    }
+    mock_gcp_services["parse"].return_value = prescription_text
+    mock_gcp_services["gemini"].return_value = json.dumps(gemini_payload)
+
+    file_content = b"%PDF-1.4 mock prescription pdf data"
+    files = {"file": ("prescription.pdf", file_content, "application/pdf")}
+
+    with patch("common_code.notification_dispatcher.dispatch_notification") as mock_dispatch:
+        mock_dispatch.return_value = True
+
+        response = client.post("/documents/upload", files=files, data={})
+        assert response.status_code == 201
+        doc_id = response.json()["id"]
+
+        doc_record = mock_db.db_store[settings.DOCUMENTS_COLLECTION][doc_id]
+        assert doc_record["status"] == "completed"
+        assert doc_record["type"] == "prescription"
+        assert len(doc_record["reminder_suggestions"]) == 2
+
+        first = doc_record["reminder_suggestions"][0]
+        second = doc_record["reminder_suggestions"][1]
+
+        assert first["title"] == "Take Metformin"
+        assert first["schedule"]["meal_timing"] is None
+        assert first["schedule"]["start_date"] is not None
+
+        assert second["title"] == "Take Dolo 650"
+        assert second["schedule"]["meal_timing"] == "after_breakfast"
+        assert second["schedule"]["start_date"] is not None
+
+        detail_response = client.get(f"/documents/{doc_id}")
+        assert detail_response.status_code == 200
+        detail_data = detail_response.json()
+        assert len(detail_data["reminder_suggestions"]) == 2
+        assert detail_data["reminder_suggestions"][0]["title"] == "Take Metformin"
+        assert detail_data["reminder_suggestions"][1]["title"] == "Take Dolo 650"
+
+
+def test_non_prescription_document_returns_no_reminder_suggestions(client, mock_db, mock_user, mock_gcp_services):
+    lab_text = "Lab Report HbA1c 7.1 percent"
+    gemini_payload = {
+        "category": "lab_report",
+        "summary": "This is a lab report.",
+        "doctor_name": "Dr Lab",
+        "document_date": "2026-07-04",
+        "patient_name": "Test User",
+        "medications": [],
+        "abnormal_labs": [
+            {
+                "parameter_name": "HbA1c",
+                "value": "7.1%",
+                "reference_range": "< 5.7%",
+                "status": "High"
+            }
+        ],
+        "red_flags": [],
+        "actionable_steps": ["Discuss sugar control with your doctor."],
+        "reminder_suggestions": [
+            {
+                "type": "medicine",
+                "title": "Take Fake Medicine",
+                "notes": None,
+                "notification_enabled": True,
+                "schedule": {
+                    "recurrence": "daily",
+                    "time_of_day": "09:00",
+                    "start_date": None,
+                    "end_date": None,
+                    "meal_timing": None
+                },
+                "medicine_details": {
+                    "name": "Fake Medicine",
+                    "dosage": "10mg",
+                    "frequency": "daily",
+                    "instructions": None
+                },
+                "follow_up_details": None
+            }
+        ]
+    }
+    mock_gcp_services["parse"].return_value = lab_text
+    mock_gcp_services["gemini"].return_value = json.dumps(gemini_payload)
+
+    file_content = b"%PDF-1.4 mock lab report pdf data"
+    files = {"file": ("lab-report.pdf", file_content, "application/pdf")}
+
+    with patch("common_code.notification_dispatcher.dispatch_notification") as mock_dispatch:
+        mock_dispatch.return_value = True
+
+        response = client.post("/documents/upload", files=files, data={})
+        assert response.status_code == 201
+        doc_id = response.json()["id"]
+
+        doc_record = mock_db.db_store[settings.DOCUMENTS_COLLECTION][doc_id]
+        assert doc_record["type"] == "lab_report"
+        assert doc_record["reminder_suggestions"] == []
+
+        detail_response = client.get(f"/documents/{doc_id}")
+        assert detail_response.status_code == 200
+        assert detail_response.json()["reminder_suggestions"] == []
+ 

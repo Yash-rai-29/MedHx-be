@@ -3,6 +3,12 @@ from typing import Optional, List
 from datetime import datetime
 from enum import Enum
 
+from patient_service.consultations.consultations_model import (
+    ReminderSuggestion,
+    SupportedLanguage,
+    LANGUAGE_DISPLAY_NAMES,
+)
+
 
 # ── Enums ──────────────────────────────────────────────────────────────────────
 
@@ -17,33 +23,6 @@ class DocumentType(str, Enum):
     discharge_summary  = "discharge_summary"
     imaging_report     = "imaging_report"
     other              = "other"
-
-class SupportedLanguage(str, Enum):
-    """Indian regional languages supported by both Gemini 2.5 Flash and ElevenLabs TTS."""
-    english   = "en"
-    hindi     = "hi"
-    tamil     = "ta"
-    telugu    = "te"
-    bengali   = "bn"
-    marathi   = "mr"
-    gujarati  = "gu"
-    kannada   = "kn"
-    malayalam = "ml"
-    punjabi   = "pa"
-
-# Maps language code → display name used in Gemini prompts
-LANGUAGE_DISPLAY_NAMES: dict[str, str] = {
-    "en": "English",
-    "hi": "Hindi",
-    "ta": "Tamil", 
-    "te": "Telugu",
-    "bn": "Bengali",
-    "mr": "Marathi",
-    "gu": "Gujarati",
-    "kn": "Kannada",
-    "ml": "Malayalam",
-    "pa": "Punjabi",
-}
 
 
 # ── Clinical Item Models ────────────────────────────────────────────────────────
@@ -125,6 +104,10 @@ class DocumentResponse(BaseModel):
     warnings:           List[str]                = Field(
         default=[],
         description="Processing warnings for this document (e.g. patient name mismatch, unsupported format).",
+    )
+    reminder_suggestions: List[ReminderSuggestion] = Field(
+        default=[],
+        description="Reminder suggestions extracted from prescription documents using the same contract as consultation reminders.",
     )
 
 

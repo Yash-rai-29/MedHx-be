@@ -128,7 +128,7 @@ def test_manual_reminder_creation(client, mock_db, mock_user):
         "notes": "With morning tea",
         "schedule": {
             "recurrence": "once",
-            "start_date": "2026-07-01",
+            "start_date": "2026-07-10",
             "time_of_day": "08:00"
         },
         "medicine_details": {
