@@ -62,8 +62,7 @@ class PatientConsultationDetail(BaseModel):
     pdf_ref: Optional[str] = Field(None, alias="pdfRef")
     pdf_url: Optional[str] = None
 
-    class Config:
-        populate_by_name = True
+    model_config = ConfigDict(populate_by_name=True)
 
 class TranslateSummaryResponse(BaseModel):
     translated_text: str

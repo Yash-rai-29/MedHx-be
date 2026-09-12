@@ -186,3 +186,9 @@ harsh_discharge_summary.pdf
 resources/
 tests/
 last_bearer_token.txt
+last_bearer_token.txt
+docs/legal/privacy_policy.docx
+.gitignore
+docs/legal/terms_of_service.docx
+docs/legal/terms_of_service.pdf
+docs/legal/privacy_policy.pdf

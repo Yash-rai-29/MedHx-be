@@ -22,6 +22,10 @@ fi
 gcloud auth configure-docker "${REGION}-docker.pkg.dev" --quiet
 
 # 3. Build docker image from project root context
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+cd "$ROOT_DIR"
+
 IMAGE_TAG="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO_NAME}/${IMAGE_NAME}:latest"
 echo "Building Docker image: $IMAGE_TAG..."
 docker build --platform linux/amd64 -t "$IMAGE_TAG" -f patient_service/Dockerfile .

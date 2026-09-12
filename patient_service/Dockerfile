@@ -21,6 +21,7 @@ ENV PYTHONPATH=/app
 
 # Copy application files
 COPY common_code/ /app/common_code/
+COPY export_job/ /app/export_job/
 COPY patient_service/ /app/patient_service/
 
 # Create appuser with non-root privileges

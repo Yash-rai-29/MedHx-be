@@ -2,10 +2,15 @@
 
 import datetime
 import logging
+from typing import Any
 from google.cloud import firestore
 from firebase_admin import messaging
-from fastapi import Request
 from common_code.config import settings
+
+try:
+    from fastapi import Request
+except ImportError:
+    Request = Any  # type: ignore
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +24,25 @@ def get_db() -> firestore.AsyncClient:
     if _db is None:
         _db = firestore.AsyncClient(project=settings.GCP_PROJECT_ID)
     return _db
+
+
+def sanitize_firestore_payload(obj: Any) -> Any:
+    """
+    Recursively converts Python objects into Firestore-safe types.
+    Specifically converts datetime.date (which is not a datetime.datetime) into ISO string (YYYY-MM-DD),
+    converts Pydantic models to serializable dicts, and handles nested collections.
+    """
+    if obj is None:
+        return None
+    if isinstance(obj, datetime.date) and not isinstance(obj, datetime.datetime):
+        return obj.isoformat()
+    if hasattr(obj, "model_dump"):
+        return sanitize_firestore_payload(obj.model_dump(mode="json"))
+    if isinstance(obj, dict):
+        return {k: sanitize_firestore_payload(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple, set)):
+        return [sanitize_firestore_payload(item) for item in obj]
+    return obj
 
 
 # ── Audit logging ─────────────────────────────────────────────

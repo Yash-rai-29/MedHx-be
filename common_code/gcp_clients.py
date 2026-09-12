@@ -4,6 +4,8 @@ All clients use lazy-init singletons to avoid re-creation on every request.
 Gemini uses the `google-genai` SDK (successor to the deprecated `google-generativeai`).
 """
 
+from __future__ import annotations
+
 import asyncio
 import datetime
 import json
@@ -15,11 +17,27 @@ import google.auth
 from google.auth import impersonated_credentials
 from google.cloud import storage
 import httpx
-from google.cloud import documentai
-from google.cloud import translate_v2 as translate
-from google.cloud import texttospeech
-from google import genai
-from google.genai import types as genai_types
+try:
+    from google.cloud import documentai
+except ImportError:
+    documentai = None  # type: ignore
+
+try:
+    from google.cloud import translate_v2 as translate
+except ImportError:
+    translate = None  # type: ignore
+
+try:
+    from google.cloud import texttospeech
+except ImportError:
+    texttospeech = None  # type: ignore
+
+try:
+    from google import genai
+    from google.genai import types as genai_types
+except ImportError:
+    genai = None  # type: ignore
+    genai_types = None  # type: ignore
 
 from common_code.config import settings
 
@@ -30,9 +48,9 @@ logger = logging.getLogger(__name__)
 # ══════════════════════════════════════════════════════════════
 _storage_client: storage.Client | None = None
 _signing_storage_client: storage.Client | None = None
-_translate_client: translate.Client | None = None
-_tts_client: texttospeech.TextToSpeechClient | None = None
-_genai_client: genai.Client | None = None
+_translate_client: Any | None = None
+_tts_client: Any | None = None
+_genai_client: Any | None = None
 
 
 def _get_storage() -> storage.Client:
@@ -82,18 +100,14 @@ def _get_tts() -> texttospeech.TextToSpeechClient:
 def _get_genai() -> genai.Client:
     global _genai_client
     if _genai_client is None:
-        api_key = os.environ.get("GEMINI_API_KEY")
-        if api_key:
-            _genai_client = genai.Client(api_key=api_key)
-        else:
-            # Vertex AI: use GEMINI_LOCATION (us-central1) — flash models are NOT
-            # available in asia-south1 via Vertex AI.
-            gemini_location = getattr(settings, "GEMINI_LOCATION", "us-central1")
-            _genai_client = genai.Client(
-                vertexai=True,
-                project=settings.GCP_PROJECT_ID,
-                location=gemini_location
-            )
+        # Vertex AI: use GEMINI_LOCATION (us-central1) — flash models run on Vertex AI
+        # Authentication automatically uses Google Application Default Credentials (ADC) / IAM
+        gemini_location = getattr(settings, "GEMINI_LOCATION", "us-central1")
+        _genai_client = genai.Client(
+            vertexai=True,
+            project=settings.GCP_PROJECT_ID,
+            location=gemini_location,
+        )
     return _genai_client
 
 
@@ -437,17 +451,33 @@ def synthesize_speech(text: str, language_code: str = "hi-IN") -> bytes:
 
 
 # ══════════════════════════════════════════════════════════════
-#  5. Gemini (google-genai SDK)
-# ══════════════════════════════════════════════════════════════
 def generate_gemini_content(prompt: str, json_response: bool = False, model: str | None = None) -> str:
-    """Generates text via Gemini model (sync — use async_generate_gemini_content in async contexts)."""
+    """Generates text via Gemini using client.interactions or client.models."""
     client = _get_genai()
+    model_name = model or settings.GEMINI_MODEL
+
+    # 1. Try modern client.interactions.create with thinking summaries
+    try:
+        gen_config: dict[str, Any] = {"thinking_summaries": "auto"}
+        if json_response:
+            gen_config["response_mime_type"] = "application/json"
+
+        interaction = client.interactions.create(
+            model=model_name,
+            input=prompt,
+            generation_config=gen_config,
+        )
+        if hasattr(interaction, "output_text") and interaction.output_text:
+            return interaction.output_text
+    except Exception as e:
+        logger.debug(f"client.interactions.create fallback to models.generate_content: {e}")
+
+    # 2. Standard client.models.generate_content path
     config = None
     if json_response:
         config = genai_types.GenerateContentConfig(
             response_mime_type="application/json",
         )
-    model_name = model or settings.GEMINI_MODEL
     response = client.models.generate_content(
         model=model_name,
         contents=prompt,
@@ -501,36 +531,72 @@ async def async_generate_gemini_content_with_usage(
     return await asyncio.to_thread(generate_gemini_content_with_usage, prompt, json_response, model)
 
 
-async def stream_gemini_content(prompt: str, model: str | None = None):
+async def stream_gemini_content(
+    prompt: str,
+    model: str | None = None,
+    include_thoughts: bool = True,
+):
     """
-    Async generator that yields text chunks from Gemini as they arrive.
-    Bridges the sync SDK streaming iterator to an async generator via a thread + asyncio.Queue.
-    Yields empty string sentinel (None) on completion.
+    Async generator that yields text and thought chunks from Gemini as they arrive.
+    Yields dict objects: `{"type": "thought", "content": "..."}` or `{"type": "text", "content": "..."}`.
+    Raises underlying exceptions directly without masked fallbacks.
     """
     import threading
 
     client     = _get_genai()
     model_name = model or settings.GEMINI_MODEL
     loop       = asyncio.get_running_loop()
-    queue: asyncio.Queue[str | None] = asyncio.Queue()
+    queue: asyncio.Queue[Any] = asyncio.Queue()
+
+    config = None
+    if include_thoughts:
+        try:
+            config = genai_types.GenerateContentConfig(
+                thinking_config=genai_types.ThinkingConfig(include_thoughts=True)
+            )
+        except Exception:
+            config = None
 
     def _produce() -> None:
         try:
-            for chunk in client.models.generate_content_stream(model=model_name, contents=prompt):
-                if chunk.text:
-                    loop.call_soon_threadsafe(queue.put_nowait, chunk.text)
+            for chunk in client.models.generate_content_stream(
+                model=model_name,
+                contents=prompt,
+                config=config,
+            ):
+                # Inspect candidate parts to distinguish thinking thoughts from text output
+                if chunk.candidates:
+                    for cand in chunk.candidates:
+                        if cand.content and cand.content.parts:
+                            for part in cand.content.parts:
+                                if getattr(part, "thought", False) and part.text:
+                                    loop.call_soon_threadsafe(
+                                        queue.put_nowait,
+                                        {"type": "thought", "content": part.text}
+                                    )
+                                elif part.text:
+                                    loop.call_soon_threadsafe(
+                                        queue.put_nowait,
+                                        {"type": "text", "content": part.text}
+                                    )
+                elif chunk.text:
+                    loop.call_soon_threadsafe(
+                        queue.put_nowait,
+                        {"type": "text", "content": chunk.text}
+                    )
         except Exception as exc:
-            logger.warning(f"Gemini stream error: {exc}")
-            # Yield a fallback so the caller gets something
-            loop.call_soon_threadsafe(queue.put_nowait, generate_gemini_content(prompt, model=model_name))
+            logger.error(f"Gemini streaming error: {exc}", exc_info=True)
+            loop.call_soon_threadsafe(queue.put_nowait, exc)
         finally:
-            loop.call_soon_threadsafe(queue.put_nowait, None)  # sentinel
+            loop.call_soon_threadsafe(queue.put_nowait, None)
 
     threading.Thread(target=_produce, daemon=True).start()
     while True:
         item = await queue.get()
         if item is None:
             break
+        if isinstance(item, Exception):
+            raise item
         yield item
 
 

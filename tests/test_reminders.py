@@ -122,13 +122,14 @@ def test_trigger_notification_callback(client, mock_db, mock_user):
         assert "notification_id" in kwargs["data"]
 
 def test_manual_reminder_creation(client, mock_db, mock_user):
+    future_date = (datetime.date.today() + datetime.timedelta(days=1)).isoformat()
     payload = {
         "type": "medicine",
         "title": "Take Vitamin D",
         "notes": "With morning tea",
         "schedule": {
             "recurrence": "once",
-            "start_date": "2026-07-10",
+            "start_date": future_date,
             "time_of_day": "08:00"
         },
         "medicine_details": {
@@ -238,7 +239,11 @@ def test_pubsub_handler_creates_reminders(client, mock_db, mock_user):
          patch("patient_service.reminders.reminders_func.create_cloud_task") as mock_schedule:
         mock_schedule.return_value = "projects/medhx-care-ai/queues/notification-queue/tasks/task-mock"
         
-        response = client.post("/reminders/pubsub-handler", json=envelope)
+        response = client.post(
+            "/reminders/pubsub-handler",
+            json=envelope,
+            headers={"X-PubSub-Secret": "local-pubsub-secret"}
+        )
         assert response.status_code == 200
         res = response.json()
         assert res["status"] == "ok", f"Status not ok: {res}"

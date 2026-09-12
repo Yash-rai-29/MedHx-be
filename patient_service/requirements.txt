@@ -18,3 +18,5 @@ reportlab>=4.1.0
 pytest>=8.1.0
 google-cloud-secret-manager>=2.20.0
 google-cloud-tasks>=2.16.0
+google-cloud-run>=0.10.0
+pyjwt>=2.8.0

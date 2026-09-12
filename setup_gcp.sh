@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# setup_gcp.sh — GCP Infrastructure Setup Script
+# setup_gcp.sh — GCP Infrastructure Bootstrap & Provisioning Script
 set -eo pipefail
 
 # Colors for log statements
@@ -14,13 +14,15 @@ PROJECT_ID="medhx-care-ai"
 REGION="asia-south1"
 BUCKET_NAME="medhx-care-media"
 SERVICE_ACCOUNT_NAME="ai-health-app-sa"
+EXPORT_SA_NAME="export-sa"
+REPO_NAME="ai-health-repo"
 
 echo -e "${BLUE}==================================================${NC}"
 echo -e "${BLUE}       GCP Bootstrap for AI Health Companion      ${NC}"
 echo -e "${BLUE}==================================================${NC}"
 echo
 
-# Confirm Project ID
+# Confirm Project ID & Region
 read -rp "Enter GCP Project ID [default: $PROJECT_ID]: " input_project
 PROJECT_ID="${input_project:-$PROJECT_ID}"
 
@@ -38,7 +40,7 @@ echo
 gcloud config set project "$PROJECT_ID"
 
 # 2. Enable Required APIs
-echo -e "${GREEN}[1/7] Enabling Google Cloud Service APIs...${NC}"
+echo -e "${GREEN}[1/8] Enabling Google Cloud Service APIs...${NC}"
 gcloud services enable \
     run.googleapis.com \
     firestore.googleapis.com \
@@ -51,13 +53,27 @@ gcloud services enable \
     storage.googleapis.com \
     iam.googleapis.com \
     secretmanager.googleapis.com \
-    cloudtasks.googleapis.com
+    cloudtasks.googleapis.com \
+    artifactregistry.googleapis.com
 
+# 3. Create Artifact Registry Repository
+echo -e "${GREEN}[2/8] Provisioning Artifact Registry Repository...${NC}"
+if ! gcloud artifacts repositories describe "$REPO_NAME" --location="$REGION" &>/dev/null; then
+    gcloud artifacts repositories create "$REPO_NAME" \
+        --repository-format=docker \
+        --location="$REGION" \
+        --description="Docker repository for AI Health Companion microservices & jobs"
+    echo "Artifact Registry repository '$REPO_NAME' created."
+else
+    echo "Artifact Registry repository '$REPO_NAME' already exists."
+fi
 
-# 3. Create Service Account for Cloud Run services
-echo -e "${GREEN}[2/7] Provisioning Service Account...${NC}"
+# 4. Provision Service Accounts
+echo -e "${GREEN}[3/8] Provisioning Service Accounts...${NC}"
 SA_EMAIL="${SERVICE_ACCOUNT_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
+EXPORT_SA_EMAIL="${EXPORT_SA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
 
+# Main Application Service Account
 if ! gcloud iam service-accounts describe "$SA_EMAIL" &>/dev/null; then
     gcloud iam service-accounts create "$SERVICE_ACCOUNT_NAME" \
         --description="Service account for AI Health Companion Cloud Run microservices" \
@@ -67,59 +83,67 @@ else
     echo "Service account already exists: $SA_EMAIL"
 fi
 
-# Provision export-sa Service Account for GCS signed URL generation via impersonation
-EXPORT_SA_NAME="export-sa"
-EXPORT_SA_EMAIL="${EXPORT_SA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
-
-echo -e "${GREEN}Provisioning export-sa Service Account...${NC}"
+# Export-SA for GCS Signed URLs via Impersonation
 if ! gcloud iam service-accounts describe "$EXPORT_SA_EMAIL" &>/dev/null; then
     gcloud iam service-accounts create "$EXPORT_SA_NAME" \
-        --description="Service account used for generating GCS signed URLs via impersonation" \
+        --description="Service account used for generating GCS signed URLs via token impersonation" \
         --display-name="AI Health Companion Export-SA"
     echo "Service account created: $EXPORT_SA_EMAIL"
 else
     echo "Service account already exists: $EXPORT_SA_EMAIL"
 fi
 
-# Allow main app service account to token create / impersonate export-sa:
-echo "Granting Token Creator role to main app service account..."
+# Allow main app service account to token create / impersonate export-sa
+echo "Granting Token Creator role to main app service account on export-sa..."
 gcloud iam service-accounts add-iam-policy-binding "$EXPORT_SA_EMAIL" \
     --member="serviceAccount:$SA_EMAIL" \
     --role="roles/iam.serviceAccountTokenCreator" >/dev/null
 
-# Also grant roles/iam.serviceAccountTokenCreator to current developer user for local runs if authenticated:
+# Allow main service account to act as service account user on itself for Cloud Run Jobs
+gcloud iam service-accounts add-iam-policy-binding "$SA_EMAIL" \
+    --member="serviceAccount:$SA_EMAIL" \
+    --role="roles/iam.serviceAccountUser" >/dev/null
+
+# Grant token creator to current developer user for local runs
 DEVELOPER_USER=$(gcloud config get-value account 2>/dev/null || echo "")
 if [[ -n "$DEVELOPER_USER" ]]; then
-    echo "Granting token creator role to developer user: $DEVELOPER_USER"
+    echo "Granting token creator role to developer user ($DEVELOPER_USER)..."
     gcloud iam service-accounts add-iam-policy-binding "$EXPORT_SA_EMAIL" \
         --member="user:$DEVELOPER_USER" \
         --role="roles/iam.serviceAccountTokenCreator" >/dev/null
 fi
 
-# 4. Grant IAM Roles to the Service Account
-echo -e "${GREEN}[3/7] Configuring IAM Roles...${NC}"
-ROLES=(
-    "roles/datastore.user"        # Firestore Read/Write/Query
-    "roles/storage.objectAdmin"   # GCS Bucket read/write
-    "roles/pubsub.publisher"      # Pub/Sub publish rights
-    "roles/pubsub.subscriber"     # Pub/Sub subscription rights
-    "roles/aiplatform.user"       # Vertex AI Gemini inference
-    "roles/documentai.apiUser"    # Document AI processor processing
-    "roles/speech.client"         # Speech-to-text Chirp client
-    "roles/cloudtranslate.user"   # Google Cloud Translation User
+# 5. Grant IAM Roles
+echo -e "${GREEN}[4/8] Configuring Project IAM Roles...${NC}"
+APP_ROLES=(
+    "roles/datastore.user"               # Firestore Read/Write/Query
+    "roles/storage.objectAdmin"          # GCS Bucket read/write
+    "roles/pubsub.publisher"             # Pub/Sub publish rights
+    "roles/pubsub.subscriber"            # Pub/Sub subscription rights
+    "roles/aiplatform.user"              # Vertex AI Gemini inference
+    "roles/documentai.apiUser"           # Document AI OCR parsing
+    "roles/speech.client"                # Speech-to-text Chirp client
+    "roles/cloudtranslate.user"          # Cloud Translation API
     "roles/secretmanager.secretAccessor" # Access secrets in Secret Manager
-    "roles/cloudtasks.enqueuer"          # Schedule Cloud Tasks
+    "roles/cloudtasks.enqueuer"          # Enqueue Cloud Tasks
+    "roles/run.developer"                # Trigger Cloud Run Jobs (export-job, account-deletion-job)
+    "roles/firebase.admin"               # Firebase Auth user administration & claim management
 )
 
-for role in "${ROLES[@]}"; do
-    echo "Binding role $role to service account..."
+for role in "${APP_ROLES[@]}"; do
+    echo "Binding role $role to $SA_EMAIL..."
     gcloud projects add-iam-policy-binding "$PROJECT_ID" \
         --member="serviceAccount:$SA_EMAIL" \
         --role="$role" >/dev/null
 done
 
-# 5. Create GCS Storage Bucket
-echo -e "${GREEN}[4/7] Provisioning GCS Bucket...${NC}"
+# Grant storage.objectAdmin to export-sa for direct archive reads/writes
+gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+    --member="serviceAccount:$EXPORT_SA_EMAIL" \
+    --role="roles/storage.objectAdmin" >/dev/null
+
+# 6. Create GCS Storage Bucket
+echo -e "${GREEN}[5/8] Provisioning GCS Bucket...${NC}"
 if ! gsutil ls -b "gs://$BUCKET_NAME" &>/dev/null; then
     gsutil mb -l "$REGION" "gs://$BUCKET_NAME"
     # Configure CORS on the bucket for direct-to-GCS uploads
@@ -141,15 +165,8 @@ else
     echo "GCS Bucket gs://$BUCKET_NAME already exists."
 fi
 
-# Grant export-sa access to the bucket
-echo "Granting roles/storage.objectAdmin role to export-sa on bucket gs://$BUCKET_NAME..."
-gcloud storage buckets add-iam-policy-binding "gs://$BUCKET_NAME" \
-    --member="serviceAccount:$EXPORT_SA_EMAIL" \
-    --role="roles/storage.objectAdmin" >/dev/null
-
-
-# 6. Create Pub/Sub Topics
-echo -e "${GREEN}[5/7] Creating Pub/Sub Topics...${NC}"
+# 7. Create Pub/Sub Topics
+echo -e "${GREEN}[6/8] Creating Pub/Sub Topics...${NC}"
 TOPICS=(
     "consultation-audio-uploaded"
     "consultation-transcribed"
@@ -166,20 +183,29 @@ for topic in "${TOPICS[@]}"; do
     fi
 done
 
-# 7. Create Cloud Tasks Queue
-echo -e "${GREEN}[6/7] Creating Cloud Tasks Queue...${NC}"
-if ! gcloud tasks queues describe "notification-queue" --location="$REGION" &>/dev/null; then
-    gcloud tasks queues create "notification-queue" --location="$REGION"
-    echo "Cloud Tasks Queue 'notification-queue' created."
-else
-    echo "Cloud Tasks Queue 'notification-queue' already exists."
-fi
+# 8. Create Cloud Tasks Queues
+echo -e "${GREEN}[7/8] Creating Cloud Tasks Queues...${NC}"
+QUEUES=(
+    "notification-queue"
+    "account-deletion-queue"
+)
 
-# 8. Complete bootstrap
+for q in "${QUEUES[@]}"; do
+    if ! gcloud tasks queues describe "$q" --location="$REGION" &>/dev/null; then
+        gcloud tasks queues create "$q" --location="$REGION"
+        echo "Cloud Tasks Queue '$q' created."
+    else
+        echo "Cloud Tasks Queue '$q' already exists."
+    fi
+done
+
+# 9. Complete bootstrap
 echo -e "${BLUE}==================================================${NC}"
 echo -e "${GREEN}      GCP Setup Completed Successfully!          ${NC}"
 echo -e "${BLUE}==================================================${NC}"
 echo
 echo "Your GCP environment is ready for AI Health Companion backend."
-echo "Service Account Email: $SA_EMAIL"
-echo "Deploy both services using run.sh inside patient_service/ and doctor_service/ directories."
+echo "Main Service Account: $SA_EMAIL"
+echo "Export Service Account: $EXPORT_SA_EMAIL"
+echo "Queues Provisioned: notification-queue, account-deletion-queue"
+echo "Deploy services using build.sh and run.sh inside respective service directories."

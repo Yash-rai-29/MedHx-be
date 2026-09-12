@@ -13,6 +13,8 @@ from patient_service.notifications.notifications_router import router as notific
 from patient_service.consultations.consultations_router import router as consultations_router
 from patient_service.vitals.vitals_router import router as vitals_router
 from patient_service.dashboard.dashboard_router import router as dashboard_router
+from patient_service.timeline.timeline_router import router as timeline_router
+from patient_service.export.export_router import router as export_router
 
 def create_app() -> FastAPI:
     app = FastAPI(
@@ -21,16 +23,33 @@ def create_app() -> FastAPI:
         version="1.0.0"
     )
     
-    # Configure CORS — origins come from config so they can be set per-environment
-    # via the ALLOWED_ORIGINS env var in Cloud Run.
-    # Mobile apps (Flutter) do not send CORS preflight, so this only affects web clients.
-    allowed_origins = [o.strip() for o in settings.ALLOWED_ORIGINS.split() if o.strip()]
+    # Configure CORS dynamically from environment settings (ALLOWED_ORIGINS & FRONTEND_WEB_URL)
+    origins_to_parse = [settings.ALLOWED_ORIGINS]
+    if settings.FRONTEND_WEB_URL:
+        origins_to_parse.append(settings.FRONTEND_WEB_URL)
+
+    allowed_origins = set()
+    for raw in origins_to_parse:
+        for item in raw.replace(",", " ").split():
+            cleaned = item.strip()
+            if cleaned:
+                allowed_origins.add(cleaned.rstrip("/"))
+                allowed_origins.add(cleaned.rstrip("/") + "/")
+
     app.add_middleware(
         CORSMiddleware,
-        allow_origins="*",
-        allow_credentials=True,
+        allow_origins=list(allowed_origins) if allowed_origins else ["*"],
+        allow_credentials=True if allowed_origins else False,
         allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-        allow_headers=["Authorization", "Content-Type", "X-Cloud-Tasks-Secret"],
+        allow_headers=[
+            "Authorization",
+            "Content-Type",
+            "Accept",
+            "Origin",
+            "X-Requested-With",
+            "X-Cloud-Tasks-Secret",
+            "X-PubSub-Secret",
+        ],
     )
     
     # Include routers
@@ -43,6 +62,8 @@ def create_app() -> FastAPI:
     app.include_router(consultations_router, prefix="/consultations", tags=["Consultations"])
     app.include_router(vitals_router, prefix="/vitals", tags=["Vitals"])
     app.include_router(dashboard_router, prefix="/dashboard", tags=["Dashboard"])
+    app.include_router(timeline_router, prefix="/timeline", tags=["Medical Timeline"])
+    app.include_router(export_router, prefix="/export", tags=["Data Export"])
 
     
     @app.get("/health", tags=["Health"])

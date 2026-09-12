@@ -1,7 +1,9 @@
-from pydantic import BaseModel, Field
-from typing import List, Optional
+from pydantic import BaseModel, Field, model_validator
+from typing import Any, Dict, List, Optional
 from datetime import datetime
 from enum import Enum
+
+from patient_service.auth.auth_model import AccountStatus
 
 class PlatformEnum(str, Enum):
     ios = "ios"
@@ -21,13 +23,16 @@ class PatientProfileResponse(BaseModel):
     # User account properties
     uid: Optional[str] = Field(None, description="Unique Firebase User ID")
     name: Optional[str] = Field(None, description="Patient's full name")
-    phone: Optional[str] = Field(None, description="Patient's contact phone number")
+    country_code: Optional[str] = Field(None, description="Patient's country calling code")
+    phone_number: Optional[str] = Field(None, description="Patient's phone number without country code")
     email: Optional[str] = Field(None, description="Patient's email address")
     role: Optional[str] = Field(None, description="Access role for user, e.g. patient")
     language_preference: Optional[str] = Field(None, description="Preferred app interface language (en, hi, ta, te)")
     auth_provider: Optional[str] = Field(None, description="Auth provider like google.com, password")
     accepted_privacy_policy: Optional[bool] = Field(None, description="Whether the user accepted the privacy policy")
     accepted_terms_of_service: Optional[bool] = Field(None, description="Whether the user accepted the terms of service")
+    account_status: Optional[AccountStatus] = Field(AccountStatus.active, description="Current account state: 'active' or 'pending_deletion'")
+    deletion_scheduled_at: Optional[datetime] = Field(None, description="Timestamp when account is scheduled for permanent purge if deletion requested")
 
     # Clinical profile properties
     blood_group: Optional[str] = Field(None, description="Blood group (e.g. A+, O-)")
@@ -43,6 +48,14 @@ class PatientProfileResponse(BaseModel):
     date_of_birth: Optional[str] = Field(None, description="Patient's date of birth in YYYY-MM-DD format")
     location: Optional[str] = Field(None, description="Patient's current location/region")
     onboarding_status: str = Field("pending", description="Onboarding status, e.g. completed, skipped, pending")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _populate_phone_fields(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            if not data.get("phone_number") and data.get("phone"):
+                data["phone_number"] = data.get("phone")
+        return data
 
 
 class PatientProfileUpdateRequest(BaseModel):
@@ -64,7 +77,8 @@ class PatientOnboardingRequest(BaseModel):
     
     # User demographic details
     name: Optional[str] = Field(None, description="Patient's full name")
-    phone: Optional[str] = Field(None, description="Phone number")
+    country_code: Optional[str] = Field(None, description="Country calling code (e.g. '+91')")
+    phone_number: Optional[str] = Field(None, description="Phone number without country code")
     language_preference: Optional[str] = Field(None, description="Preferred language (en, hi, ta, te)")
     
     # Clinical/background details
@@ -87,11 +101,20 @@ class PatientOnboardingRequest(BaseModel):
 class UserOnboardResponse(BaseModel):
     uid: str = Field(..., description="Unique Firebase User ID")
     name: str = Field(..., description="Patient's full name")
-    phone: Optional[str] = Field(None, description="Patient's contact phone number")
+    country_code: Optional[str] = Field(None, description="Country calling code")
+    phone_number: Optional[str] = Field(None, description="Phone number without country code")
     email: Optional[str] = Field(None, description="Patient's email address")
     role: str = Field(..., description="Access control role (patient)")
     language_preference: str = Field(..., description="Language preference selection (en, hi, ta, te)")
     onboarding_status: str = Field(..., description="Onboarding status: completed, skipped")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _populate_phone_fields(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            if not data.get("phone_number") and data.get("phone"):
+                data["phone_number"] = data.get("phone")
+        return data
 
 class OnboardingResponse(BaseModel):
     onboarding_status: str = Field(..., description="Final onboarding state: completed, skipped")
@@ -112,12 +135,56 @@ class VitalsLogResponse(BaseModel):
 
 class QRPassportResponse(BaseModel):
     name: str = Field(..., description="Patient's full name")
+    email: Optional[str] = Field(None, description="Patient's email address")
     blood_group: Optional[str] = Field(None, description="Patient's blood group")
     allergies: List[str] = Field(..., description="List of patient's documented allergies")
     chronic_conditions: List[str] = Field(..., description="List of patient's documented chronic illnesses")
     current_medications: List[str] = Field(..., description="List of patient's current medications")
     emergency_contact: Optional[EmergencyContact] = Field(None, description="Emergency contact details")
-    qr_redirect_url: Optional[str] = Field(None, description="Dynamic URL meant for the scannable QR SOS card redirecting to public SOS details page")
+    token: str = Field(..., description="Cryptographically signed 30-minute access token")
+    token_expires_at: datetime = Field(..., description="UTC expiration timestamp of the token")
+    validity_minutes: int = Field(30, description="Validity duration in minutes")
+    qr_redirect_url: str = Field(..., description="Dynamic URL pointing to frontend web app doctor view")
+
+class DoctorViewVerifyRequest(BaseModel):
+    token: str = Field(..., description="30-minute time-limited QR access token")
+    email: str = Field(..., description="Patient email address for identity verification")
+
+class DoctorConsultationSummary(BaseModel):
+    id: str = Field(..., description="Consultation document ID")
+    title: Optional[str] = Field(None, description="Consultation encounter title")
+    doctor_name: Optional[str] = Field(None, description="Attending physician / specialist")
+    date: Optional[str] = Field(None, description="Encounter date")
+    summary: Optional[str] = Field(None, description="Clinical summary and findings")
+    diagnoses: List[str] = Field(default_factory=list, description="Primary & secondary diagnoses")
+    medications: List[Any] = Field(default_factory=list, description="Prescribed medications")
+
+class DoctorDocumentSummary(BaseModel):
+    id: str = Field(..., description="Document ID")
+    title: Optional[str] = Field(None, description="Document / lab test title")
+    type: Optional[str] = Field(None, description="Document type (lab_report, prescription, scan)")
+    date: Optional[str] = Field(None, description="Report date")
+    summary: Optional[str] = Field(None, description="OCR and clinical summary")
+    abnormal_labs: List[Any] = Field(default_factory=list, description="Abnormal lab markers")
+
+class DoctorViewResponse(BaseModel):
+    valid: bool = Field(True, description="Indicates if token is valid and active")
+    patient_id: str = Field(..., description="Patient UID")
+    name: str = Field(..., description="Patient's full name")
+    email: Optional[str] = Field(None, description="Patient's email address")
+    phone: Optional[str] = Field(None, description="Patient's phone number")
+    age: Optional[int] = Field(None, description="Patient's age in years")
+    gender: Optional[str] = Field(None, description="Patient's gender")
+    blood_group: Optional[str] = Field(None, description="Patient's blood group")
+    emergency_contact: Optional[EmergencyContact] = Field(None, description="Emergency contact details")
+    allergies: List[str] = Field(default_factory=list, description="Allergies")
+    chronic_conditions: List[str] = Field(default_factory=list, description="Chronic illnesses")
+    current_medications: List[Any] = Field(default_factory=list, description="Current medications")
+    recent_vitals: List[Dict[str, Any]] = Field(default_factory=list, description="Recent biometric vital readings")
+    recent_consultations: List[DoctorConsultationSummary] = Field(default_factory=list, description="Recent clinical consultations")
+    recent_documents: List[DoctorDocumentSummary] = Field(default_factory=list, description="Recent test reports & prescriptions")
+    token_expires_at: datetime = Field(..., description="UTC expiration timestamp of the token")
+    remaining_seconds: int = Field(..., description="Remaining seconds before token expiry")
 
 class FCMTokenUpdateRequest(BaseModel):
     fcm_token: str = Field(..., description="The Firebase Cloud Messaging device registration token")

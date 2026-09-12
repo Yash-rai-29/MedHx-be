@@ -3,13 +3,11 @@ import datetime
 import time
 from collections import defaultdict
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
-from fastapi.responses import HTMLResponse
 from google.cloud import firestore
 from typing import List
 from common_code.firestore import get_db, log_audit_event
 from common_code.firebase_auth import require_role
 from common_code.config import settings
-from common_code.templates import render_sos_template
 from patient_service.profile.profile_model import (
     PatientProfileResponse,
     PatientProfileUpdateRequest,
@@ -19,6 +17,8 @@ from patient_service.profile.profile_model import (
     VitalsLogRequest,
     VitalsLogResponse,
     QRPassportResponse,
+    DoctorViewVerifyRequest,
+    DoctorViewResponse,
     FCMTokenUpdateRequest,
     FCMTokenUpdateResponse
 )
@@ -28,6 +28,7 @@ from patient_service.profile.profile_func import (
     log_patient_vitals,
     get_patient_vitals_history,
     get_patient_qr_passport,
+    verify_and_get_doctor_view,
     update_fcm_token
 )
 
@@ -152,8 +153,6 @@ async def onboard_patient(
         missing_fields.append("gender")
     if not req.date_of_birth:
         missing_fields.append("date_of_birth")
-    if not req.phone:
-        missing_fields.append("phone")
     if req.allergies is None:
         missing_fields.append("allergies")
     if not req.height or req.height <= 0:
@@ -185,8 +184,10 @@ async def onboard_patient(
     user_update = {"onboarding_status": "completed"}
     if req.name:
         user_update["name"] = req.name
-    if req.phone:
-        user_update["phone"] = req.phone
+    if req.country_code is not None:
+        user_update["country_code"] = req.country_code or None
+    if req.phone_number is not None:
+        user_update["phone_number"] = req.phone_number or None
     if req.language_preference:
         user_update["language_preference"] = req.language_preference
     if req.date_of_birth:
@@ -262,39 +263,40 @@ async def register_fcm_token(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.get("/sos/{uid}", response_class=HTMLResponse)
-async def get_public_sos_card(
-    uid: str,
+@router.post("/sos/verify", response_model=DoctorViewResponse)
+async def verify_doctor_view(
+    req: DoctorViewVerifyRequest,
     request: Request,
     db: firestore.AsyncClient = Depends(get_db),
     _: None = Depends(_sos_rate_limit),
 ):
     """
-    Public unauthenticated endpoint to retrieve critical patient SOS metadata.
-    Designed for emergency responders scanning the patient's QR SOS card.
-    Renders a mobile-friendly, high-contrast HTML card.
+    Public unauthenticated endpoint used by the frontend web portal (https://medhx-ai.vercel.app/)
+    to verify a 30-minute time-limited QR token and email, returning comprehensive clinical records for doctor review.
     """
     try:
-        passport = await get_patient_qr_passport(uid, db)
-    except ValueError:
+        doctor_view = await verify_and_get_doctor_view(
+            token=req.token,
+            email=req.email,
+            db=db,
+        )
+        return doctor_view
+    except PermissionError as pe:
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Emergency medical profile not found."
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=str(pe),
+        )
+    except ValueError as ve:
+        err_msg = str(ve)
+        status_code = status.HTTP_401_UNAUTHORIZED if "expired" in err_msg.lower() else status.HTTP_400_BAD_REQUEST
+        raise HTTPException(
+            status_code=status_code,
+            detail=err_msg,
         )
     except Exception as e:
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
-        
-    ec_name = passport.emergency_contact.name if passport.emergency_contact else "Not Configured"
-    ec_phone = passport.emergency_contact.phone if passport.emergency_contact else "Not Configured"
-    
-    html_content = render_sos_template(
-        name=passport.name,
-        blood_group=passport.blood_group,
-        allergies=passport.allergies,
-        chronic_conditions=passport.chronic_conditions,
-        current_medications=passport.current_medications,
-        emergency_contact_name=ec_name,
-        emergency_contact_phone=ec_phone
-    )
-    return HTMLResponse(content=html_content, status_code=200)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to retrieve clinical doctor view: {e}",
+        )
+
 

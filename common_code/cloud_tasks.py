@@ -59,6 +59,28 @@ def create_cloud_task(
         return f"error/{task_name}"
 
 
+def delete_cloud_task(task_full_name: str) -> bool:
+    """
+    Deletes a specific Cloud Task by its full resource path.
+    Swallows 'not found' errors gracefully.
+    """
+    if not task_full_name or task_full_name.startswith("mock/") or task_full_name.startswith("error/"):
+        return True
+
+    if settings.ENVIRONMENT == "development":
+        logger.info(f"[DEV] Mock delete Cloud Task: {task_full_name}")
+        return True
+
+    try:
+        client = tasks_v2.CloudTasksClient()
+        client.delete_task(name=task_full_name)
+        logger.info(f"Deleted Cloud Task: {task_full_name}")
+        return True
+    except Exception as e:
+        logger.warning(f"Could not delete Cloud Task '{task_full_name}': {e}")
+        return False
+
+
 def cancel_reminder_task(
     reminder_id: str,
     target_at: datetime.datetime,

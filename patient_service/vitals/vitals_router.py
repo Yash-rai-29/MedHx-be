@@ -1,3 +1,4 @@
+from datetime import date
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from google.cloud import firestore
 from typing import List, Optional
@@ -15,6 +16,7 @@ from patient_service.vitals.vitals_func import (
 from patient_service.vitals.vitals_model import (
     VitalLatestResponse,
     VitalTrendResponse,
+    VitalsListResponse,
     VitalsLogRequest,
     VitalsLogResponse,
 )
@@ -33,12 +35,13 @@ async def log_vital(
     db: firestore.AsyncClient = Depends(get_db),
 ):
     """
-    Log one or more vitals in a single reading session.
+    Log one or more core vitals in a single reading session.
 
-    - Provide any combination of vital fields — at least one is required.
-    - BMI is auto-computed when both `weight` and `height` are supplied.
-    - Each value is evaluated against Indian reference ranges and flagged accordingly.
-    - `measured_at` supports backdating (e.g. entering yesterday's glucometer reading).
+    - Provide any combination of core vitals (BP, Heart Rate, Glucose, SpO2, Temperature, Weight/Height, Respiratory Rate).
+    - BMI & category are auto-computed when both `weight` and `height` are supplied.
+    - Temperature auto-converts from Fahrenheit to Celsius if value > 45 (e.g. 98.6°F -> 37.0°C).
+    - Each value is evaluated against Indian clinical reference ranges and flagged.
+    - `measured_at` supports backdating (e.g. entering yesterday's reading).
     """
     uid = current_user["uid"]
     try:
@@ -60,8 +63,8 @@ async def latest_per_type(
     db: firestore.AsyncClient = Depends(get_db),
 ):
     """
-    Returns the single most recent reading for each vital type that has ever been logged.
-    Use this to populate dashboard vital summary cards.
+    Returns the single most recent reading for each vital category ever logged.
+    Use this to populate dashboard summary cards.
     """
     uid = current_user["uid"]
     return await get_latest_vitals(uid, db)
@@ -80,8 +83,7 @@ async def vital_trend(
 
     Valid `vital_type` values:
     blood_pressure, blood_glucose, heart_rate, spo2, temperature, weight_bmi,
-    respiratory_rate, hba1c, cholesterol, uric_acid, creatinine, hemoglobin,
-    waist_circumference
+    respiratory_rate
     """
     uid = current_user["uid"]
     try:
@@ -90,23 +92,43 @@ async def vital_trend(
         raise HTTPException(status_code=400, detail=str(e))
 
 
-@router.get("", response_model=List[VitalsLogResponse])
+@router.get("", response_model=VitalsListResponse)
 async def list_vital_logs(
     vital_type: Optional[str] = Query(
         None,
         description=f"Filter by vital type. One of: {_VALID_TYPES}",
     ),
-    limit: int = Query(50, ge=1, le=200, description="Maximum entries to return"),
+    from_date: Optional[date] = Query(
+        None,
+        description="Filter readings on or after this date (inclusive, YYYY-MM-DD)"
+    ),
+    to_date: Optional[date] = Query(
+        None,
+        description="Filter readings on or before this date (inclusive, YYYY-MM-DD)"
+    ),
+    cursor: Optional[str] = Query(
+        None,
+        description="Pagination cursor. Pass the 'next_cursor' value from the previous page to fetch older readings."
+    ),
+    limit: int = Query(50, ge=1, le=200, description="Maximum entries per page (default 50, max 200)"),
     current_user: dict = Depends(patient_gate),
     db: firestore.AsyncClient = Depends(get_db),
 ):
     """
-    Returns all vitals entries for the patient, newest first.
-    Filter by `vital_type` to fetch entries for a specific measurement category.
+    Returns paginated vitals entries for the patient, newest first.
+    Supports filtering by `vital_type`, date boundaries, and cursor pagination.
     """
     uid = current_user["uid"]
     try:
-        return await list_vitals(uid, vital_type, limit, db)
+        return await list_vitals(
+            uid=uid,
+            vital_type=vital_type,
+            from_date=from_date,
+            to_date=to_date,
+            cursor=cursor,
+            limit=limit,
+            db=db,
+        )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 

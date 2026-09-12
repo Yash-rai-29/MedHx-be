@@ -55,19 +55,28 @@ class Settings(BaseSettings):
     LEGAL_COLLECTION: str = "legal_documents"
     NOTIFICATIONS_COLLECTION: str = "notifications"
     DOCUMENT_CHUNKS_COLLECTION: str = "document_chunks"
+    EXPORTS_COLLECTION: str = "user_exports"
+    ACCOUNT_DELETIONS_COLLECTION: str = "account_deletion_requests"
 
 
     # ── Runtime ───────────────────────────────────────────────
     ENVIRONMENT: str = "development"
     GOOGLE_APPLICATION_CREDENTIALS: Optional[str] = None
     CLOUD_TASKS_QUEUE_NAME: str = "notification-queue"
+    ACCOUNT_DELETION_QUEUE_NAME: str = "account-deletion-queue"
+    ACCOUNT_DELETION_GRACE_PERIOD_HOURS: int = 48
     CLOUD_TASKS_SECRET: Optional[str] = "local-tasks-secret"
+    PUBSUB_VERIFICATION_SECRET: Optional[str] = "local-pubsub-secret"
     SERVICE_URL: Optional[str] = None
+    FRONTEND_WEB_URL: str = "https://medhx-ai.vercel.app"
+    QR_PASSPORT_TOKEN_EXPIRY_MINUTES: int = 30
+    QR_PASSPORT_SECRET: str = "medhx-qr-passport-hmac-secret-2026"
+    CLOUD_RUN_EXPORT_JOB_NAME: str = "export-job"
+    CLOUD_RUN_DELETION_JOB_NAME: str = "account-deletion-job"
+    CLOUD_RUN_JOB_REGION: str = "asia-south1"
 
     # ── CORS ──────────────────────────────────────────────────
-    # Space-separated list of allowed origins. Override via env var in Cloud Run.
-    # Example: "https://medhx.web.app https://medhx.firebaseapp.com"
-    ALLOWED_ORIGINS: str = "http://localhost:3000 http://localhost:8080"
+    ALLOWED_ORIGINS: str = "http://localhost:3000 http://localhost:8080 https://medhx-ai.vercel.app https://medhx.web.app https://medhx.firebaseapp.com"
 
     # ── ElevenLabs ────────────────────────────────────────────
     ELEVENLABS_API_KEY: Optional[str] = None

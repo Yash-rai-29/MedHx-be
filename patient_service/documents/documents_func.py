@@ -6,6 +6,7 @@ import logging
 from typing import Optional
 from google.cloud import firestore
 from common_code.config import settings
+from common_code.firestore import sanitize_firestore_payload
 from common_code.pii_masker import mask_pii
 from common_code.gcp_clients import (
     upload_bytes_to_gcs,
@@ -208,7 +209,7 @@ def _coerce_reminder_suggestions(raw: list) -> list[dict]:
 
         try:
             suggestion = ReminderSuggestion(**payload)
-            result.append(suggestion.model_dump())
+            result.append(suggestion.model_dump(mode="json"))
             seen_titles.add(title_key)
         except Exception as e:
             logger.warning(f"Skipping malformed document reminder suggestion '{payload.get('title', '?')}': {e}")
@@ -217,9 +218,9 @@ def _coerce_reminder_suggestions(raw: list) -> list[dict]:
 
 
 def _resolve_suggestion_dates(suggestions: list[dict]) -> list[dict]:
-    """Resolve reminder start/end dates for extracted medicine suggestions."""
+    """Resolve reminder start/end dates for extracted medicine suggestions ensuring ISO strings."""
     import re
-    from datetime import timedelta
+    from datetime import date, timedelta
     from zoneinfo import ZoneInfo
 
     now_ist = datetime.datetime.now(ZoneInfo("Asia/Kolkata"))
@@ -252,25 +253,37 @@ def _resolve_suggestion_dates(suggestions: list[dict]) -> list[dict]:
         return n
 
     for suggestion in suggestions:
-        if suggestion.get("type") != "medicine":
+        if not isinstance(suggestion, dict) or suggestion.get("type") != "medicine":
             continue
         schedule = suggestion.get("schedule")
         if not isinstance(schedule, dict):
             continue
-        if schedule.get("start_date") is not None:
-            continue
 
-        hour, minute = _parse_reminder_hour_minute(schedule)
-        dose_minutes = hour * 60 + minute
-        now_minutes = now_ist.hour * 60 + now_ist.minute
-        start_date = today_ist if now_minutes < dose_minutes else today_ist + timedelta(days=1)
-        schedule["start_date"] = start_date.isoformat()
+        start_val = schedule.get("start_date")
+        if isinstance(start_val, (datetime.date, datetime.datetime)):
+            schedule["start_date"] = start_val.isoformat()
+            start_val = schedule["start_date"]
+        elif not start_val:
+            hour, minute = _parse_reminder_hour_minute(schedule)
+            dose_minutes = hour * 60 + minute
+            now_minutes = now_ist.hour * 60 + now_ist.minute
+            start_date = today_ist if now_minutes < dose_minutes else today_ist + timedelta(days=1)
+            schedule["start_date"] = start_date.isoformat()
+            start_val = schedule["start_date"]
 
-        duration_str = ((suggestion.get("medicine_details") or {}).get("duration") or "").strip()
-        duration_days = _parse_duration_days(duration_str)
-        if duration_days is not None:
-            end_date = start_date + timedelta(days=duration_days - 1)
-            schedule["end_date"] = end_date.isoformat()
+        end_val = schedule.get("end_date")
+        if isinstance(end_val, (datetime.date, datetime.datetime)):
+            schedule["end_date"] = end_val.isoformat()
+        elif not end_val:
+            duration_str = ((suggestion.get("medicine_details") or {}).get("duration") or "").strip()
+            duration_days = _parse_duration_days(duration_str)
+            if duration_days is not None and start_val:
+                try:
+                    start_date_obj = datetime.date.fromisoformat(str(start_val)[:10])
+                    end_date = start_date_obj + timedelta(days=duration_days - 1)
+                    schedule["end_date"] = end_date.isoformat()
+                except Exception:
+                    pass
 
         suggestion["schedule"] = schedule
 
@@ -583,7 +596,7 @@ async def background_parse_and_index_document(
             abnormal_labs          = _coerce_abnormal_labs(parsed.get("abnormal_labs", []))
             red_flags              = [s for s in parsed.get("red_flags", []) if isinstance(s, str)]
             actionable_steps       = [s for s in parsed.get("actionable_steps", []) if isinstance(s, str)]
-            reminder_suggestions   = _coerce_reminder_suggestions(parsed.get("reminder_suggestions", []))
+            raw_suggestions        = parsed.get("reminder_suggestions", []) if isinstance(parsed.get("reminder_suggestions"), list) else []
             _gemini_parse_ok       = True
         except (json.JSONDecodeError, ValueError, Exception) as je:
             logger.warning(f"[doc:{doc_id}] Failed to parse Gemini JSON: {je}. Raw output: {gemini_output[:200]}")
@@ -601,8 +614,8 @@ async def background_parse_and_index_document(
             reminder_suggestions = []
         else:
             validated_suggestions: list[dict] = []
-            for suggestion in reminder_suggestions:
-                if suggestion.get("type") != "medicine":
+            for suggestion in raw_suggestions:
+                if not isinstance(suggestion, dict) or suggestion.get("type") != "medicine":
                     continue
                 med_name = ((suggestion.get("medicine_details") or {}).get("name") or suggestion.get("title") or "").strip()
                 words = [w for w in med_name.lower().split() if len(w) >= 4]
@@ -610,7 +623,8 @@ async def background_parse_and_index_document(
                     logger.info(f"[doc:{doc_id}] Dropping hallucinated reminder suggestion: {med_name}")
                     continue
                 validated_suggestions.append(suggestion)
-            reminder_suggestions = _resolve_suggestion_dates(validated_suggestions)
+            resolved_suggestions = _resolve_suggestion_dates(validated_suggestions)
+            reminder_suggestions = _coerce_reminder_suggestions(resolved_suggestions)
 
         # 3a. Collect processing warnings
         doc_warnings: list[str] = []
@@ -666,7 +680,7 @@ async def background_parse_and_index_document(
         }
         if final_title is not None:
             update_payload["title"] = final_title
-        await doc_ref.update(update_payload)
+        await doc_ref.update(sanitize_firestore_payload(update_payload))
         logger.info(f"[doc:{doc_id}] Firestore updated with status=completed")
 
         # 5. Push notification to patient

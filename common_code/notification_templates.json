@@ -29,6 +29,11 @@
     "default_body": "Hi {patient_first_name}, your consultation recording has been analysed. Tap to view your summary.",
     "deeplink_template": "/consultations/audio/{consultation_id}"
   },
+  "export": {
+    "default_title": "Medical Data Export Ready 📦",
+    "default_body": "Hi {patient_first_name}, your requested health records export is ready to download (valid for 24 hours).",
+    "deeplink_template": "/profile/export/{export_id}"
+  },
   "general": {
     "default_title": "Update from Health Companion 🔔",
     "default_body": "Hello {patient_first_name}, you have a new update.",

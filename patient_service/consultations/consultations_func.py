@@ -10,6 +10,7 @@ from zoneinfo import ZoneInfo
 from google.cloud import firestore
 
 from common_code.config import settings
+from common_code.firestore import sanitize_firestore_payload
 from common_code.notification_dispatcher import dispatch_notification
 from common_code.pii_masker import mask_pii
 from common_code.gcp_clients import (
@@ -581,7 +582,7 @@ async def background_process_audio_consultation(
         }
         if consultation_title:
             update["title"] = consultation_title
-        await doc_ref.update(update)
+        await doc_ref.update(sanitize_firestore_payload(update))
 
         # Store Eval metrics in a sub-collection "evals" inside the document under "metrics"
         eval_metrics_dict = {
@@ -596,7 +597,7 @@ async def background_process_audio_consultation(
             "hallucinated_dropped":  hallucinated_dropped,
             "safety_warnings":       safety_warnings,
         }
-        await doc_ref.collection("evals").document("metrics").set(eval_metrics_dict)
+        await doc_ref.collection("evals").document("metrics").set(sanitize_firestore_payload(eval_metrics_dict))
         logger.info(f"Audio consultation {consultation_id} processed successfully.")
 
         # Build a specific body from the extracted data we already have
@@ -745,28 +746,37 @@ def _resolve_suggestion_dates(suggestions: list[dict]) -> list[dict]:
         return n  # days
 
     for s in suggestions:
-        if s.get("type") != "medicine":
+        if not isinstance(s, dict) or s.get("type") != "medicine":
             continue
         sched = s.get("schedule")
         if not isinstance(sched, dict):
             continue
-        if sched.get("start_date") is not None:
-            continue  # already resolved — don't overwrite
 
-        h, m       = _parse_reminder_hour_minute(sched)
-        dose_mins  = h * 60 + m
-        now_mins   = now_ist.hour * 60 + now_ist.minute
-        start_date: date = today_ist if now_mins < dose_mins else today_ist + timedelta(days=1)
+        start_val = sched.get("start_date")
+        if isinstance(start_val, (date, datetime)):
+            sched["start_date"] = start_val.isoformat()
+            start_val = sched["start_date"]
+        elif not start_val:
+            h, m       = _parse_reminder_hour_minute(sched)
+            dose_mins  = h * 60 + m
+            now_mins   = now_ist.hour * 60 + now_ist.minute
+            start_date: date = today_ist if now_mins < dose_mins else today_ist + timedelta(days=1)
+            sched["start_date"] = start_date.isoformat()
+            start_val = sched["start_date"]
 
-        sched["start_date"] = start_date.isoformat()
-
-        duration_str = ((s.get("medicine_details") or {}).get("duration") or "").strip()
-        duration_days = _parse_duration_days(duration_str)
-        if duration_days is not None:
-            # end_date is the last day the patient should take the medicine.
-            # start_date counts as day 1, so end_date = start_date + duration_days - 1.
-            end_date = start_date + timedelta(days=duration_days - 1)
-            sched["end_date"] = end_date.isoformat()
+        end_val = sched.get("end_date")
+        if isinstance(end_val, (date, datetime)):
+            sched["end_date"] = end_val.isoformat()
+        elif not end_val:
+            duration_str = ((s.get("medicine_details") or {}).get("duration") or "").strip()
+            duration_days = _parse_duration_days(duration_str)
+            if duration_days is not None and start_val:
+                try:
+                    start_date_obj = date.fromisoformat(str(start_val)[:10])
+                    end_date = start_date_obj + timedelta(days=duration_days - 1)
+                    sched["end_date"] = end_date.isoformat()
+                except Exception:
+                    pass
 
         s["schedule"] = sched
 

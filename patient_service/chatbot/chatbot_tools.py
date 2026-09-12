@@ -9,7 +9,6 @@ language response.
 
 import asyncio
 import datetime
-import logging
 from typing import Optional
 from zoneinfo import ZoneInfo
 
@@ -21,6 +20,7 @@ from common_code.config import settings
 
 IST = ZoneInfo("Asia/Kolkata")
 
+import logging
 logger = logging.getLogger(__name__)
 
 
@@ -31,6 +31,105 @@ logger = logging.getLogger(__name__)
 CHATBOT_TOOLS = genai_types.Tool(
     function_declarations=[
 
+        # ── Vitals Tools ───────────────────────────────────────
+        genai_types.FunctionDeclaration(
+            name="log_vitals",
+            description=(
+                "Log one or more patient vital signs into their health profile. "
+                "Supported vitals: weight (kg), height (cm), blood pressure (systolic/diastolic in mmHg), "
+                "heart rate/pulse (bpm), blood glucose/sugar (fasting, post-meal, or random in mg/dL), "
+                "oxygen saturation SpO2 (%), body temperature (°C or °F), and respiratory rate. "
+                "Use when the patient provides a vital reading, e.g. 'Add weight 50kg', 'Log BP 120/80', "
+                "'My fasting sugar is 95', 'Record temperature 98.6'."
+            ),
+            parameters=genai_types.Schema(
+                type="OBJECT",
+                properties={
+                    "weight": genai_types.Schema(
+                        type="NUMBER",
+                        description="Body weight in kilograms (e.g. 50.0 or 72.5)",
+                    ),
+                    "height": genai_types.Schema(
+                        type="NUMBER",
+                        description="Height in centimeters (e.g. 165.0 or 175.0)",
+                    ),
+                    "systolic": genai_types.Schema(
+                        type="INTEGER",
+                        description="Systolic blood pressure in mmHg (e.g. 120)",
+                    ),
+                    "diastolic": genai_types.Schema(
+                        type="INTEGER",
+                        description="Diastolic blood pressure in mmHg (e.g. 80)",
+                    ),
+                    "heart_rate": genai_types.Schema(
+                        type="INTEGER",
+                        description="Heart rate / pulse in beats per minute (e.g. 72)",
+                    ),
+                    "glucose_fasting": genai_types.Schema(
+                        type="NUMBER",
+                        description="Fasting blood glucose in mg/dL (e.g. 95.0)",
+                    ),
+                    "glucose_post_meal": genai_types.Schema(
+                        type="NUMBER",
+                        description="Post-meal blood glucose in mg/dL (e.g. 140.0)",
+                    ),
+                    "glucose_random": genai_types.Schema(
+                        type="NUMBER",
+                        description="Random blood glucose in mg/dL",
+                    ),
+                    "spo2": genai_types.Schema(
+                        type="NUMBER",
+                        description="Oxygen saturation SpO2 percentage (e.g. 98.0)",
+                    ),
+                    "temperature": genai_types.Schema(
+                        type="NUMBER",
+                        description="Body temperature in °C or °F (e.g. 37.0 or 98.6)",
+                    ),
+                    "respiratory_rate": genai_types.Schema(
+                        type="INTEGER",
+                        description="Respiratory rate in breaths per minute (e.g. 16)",
+                    ),
+                    "notes": genai_types.Schema(
+                        type="STRING",
+                        description="Optional patient note or context (e.g. 'After morning walk')",
+                    ),
+                },
+            ),
+        ),
+
+        genai_types.FunctionDeclaration(
+            name="get_latest_vitals",
+            description=(
+                "Retrieve the patient's most recently recorded vital signs (blood pressure, "
+                "blood sugar, heart rate, SpO2, temperature, weight/BMI). "
+                "Use when the patient asks 'What was my last BP?', 'Show my recent vitals', etc."
+            ),
+            parameters=genai_types.Schema(type="OBJECT", properties={}),
+        ),
+
+        genai_types.FunctionDeclaration(
+            name="get_vital_trend",
+            description=(
+                "Retrieve historical time-series trend data for a specific vital over the past N days. "
+                "Use when the patient asks 'How has my blood pressure been this month?' or 'Show my glucose trend'."
+            ),
+            parameters=genai_types.Schema(
+                type="OBJECT",
+                properties={
+                    "vital_type": genai_types.Schema(
+                        type="STRING",
+                        description="One of: 'blood_pressure', 'blood_glucose', 'heart_rate', 'spo2', 'temperature', 'weight_bmi', 'respiratory_rate'",
+                    ),
+                    "days": genai_types.Schema(
+                        type="INTEGER",
+                        description="Number of past days to query (default 30)",
+                    ),
+                },
+                required=["vital_type"],
+            ),
+        ),
+
+        # ── Document Tools ─────────────────────────────────────
         genai_types.FunctionDeclaration(
             name="list_documents",
             description=(
@@ -41,6 +140,7 @@ CHATBOT_TOOLS = genai_types.Tool(
             parameters=genai_types.Schema(type="OBJECT", properties={}),
         ),
 
+        # ── Reminder Tools ─────────────────────────────────────
         genai_types.FunctionDeclaration(
             name="list_reminders",
             description=(
@@ -167,6 +267,7 @@ CHATBOT_TOOLS = genai_types.Tool(
             ),
         ),
 
+        # ── Consultation Tools ─────────────────────────────────
         genai_types.FunctionDeclaration(
             name="list_consultations",
             description=(
@@ -216,7 +317,13 @@ async def execute_tool(
 ) -> str:
     """Dispatches a Gemini function call to the appropriate backend handler."""
     try:
-        if tool_name == "list_documents":
+        if tool_name == "log_vitals":
+            return await _tool_log_vitals(uid, args, db)
+        elif tool_name == "get_latest_vitals":
+            return await _tool_get_latest_vitals(uid, db)
+        elif tool_name == "get_vital_trend":
+            return await _tool_get_vital_trend(uid, args, db)
+        elif tool_name == "list_documents":
             return await _tool_list_documents(uid, db)
         elif tool_name == "list_reminders":
             return await _tool_list_reminders(uid, args, db)
@@ -235,6 +342,98 @@ async def execute_tool(
     except Exception as e:
         logger.error(f"Tool execution error [{tool_name}]: {e}")
         return f"Error executing {tool_name}: {str(e)}"
+
+
+async def _tool_log_vitals(uid: str, args: dict, db: firestore.AsyncClient) -> str:
+    from patient_service.vitals.vitals_func import log_vitals
+    from patient_service.vitals.vitals_model import VitalsLogRequest, DeviceSource
+
+    # Sanitize and convert types
+    req = VitalsLogRequest(
+        weight=float(args["weight"]) if args.get("weight") is not None else None,
+        height=float(args["height"]) if args.get("height") is not None else None,
+        systolic=int(args["systolic"]) if args.get("systolic") is not None else None,
+        diastolic=int(args["diastolic"]) if args.get("diastolic") is not None else None,
+        heart_rate=int(args["heart_rate"]) if args.get("heart_rate") is not None else None,
+        glucose_fasting=float(args["glucose_fasting"]) if args.get("glucose_fasting") is not None else None,
+        glucose_post_meal=float(args["glucose_post_meal"]) if args.get("glucose_post_meal") is not None else None,
+        glucose_random=float(args["glucose_random"]) if args.get("glucose_random") is not None else None,
+        spo2=float(args["spo2"]) if args.get("spo2") is not None else None,
+        temperature=float(args["temperature"]) if args.get("temperature") is not None else None,
+        respiratory_rate=int(args["respiratory_rate"]) if args.get("respiratory_rate") is not None else None,
+        notes=args.get("notes"),
+        device_source=DeviceSource.manual,
+    )
+
+    res = await log_vitals(uid, req, db)
+    lines = ["✅ Vital signs recorded successfully:\n"]
+
+    if res.weight is not None:
+        lines.append(f"• Weight: {res.weight} kg")
+    if res.height is not None:
+        lines.append(f"• Height: {res.height} cm")
+    if res.bmi is not None:
+        lines.append(f"• Calculated BMI: {res.bmi} ({res.bmi_category})")
+    if res.systolic is not None and res.diastolic is not None:
+        lines.append(f"• Blood Pressure: {res.systolic}/{res.diastolic} mmHg")
+    elif res.systolic is not None:
+        lines.append(f"• Systolic BP: {res.systolic} mmHg")
+    if res.heart_rate is not None:
+        lines.append(f"• Heart Rate: {res.heart_rate} bpm")
+    if res.glucose_fasting is not None:
+        lines.append(f"• Fasting Blood Sugar: {res.glucose_fasting} mg/dL")
+    if res.glucose_post_meal is not None:
+        lines.append(f"• Post-meal Blood Sugar: {res.glucose_post_meal} mg/dL")
+    if res.glucose_random is not None:
+        lines.append(f"• Random Blood Sugar: {res.glucose_random} mg/dL")
+    if res.spo2 is not None:
+        lines.append(f"• Oxygen Saturation (SpO2): {res.spo2}%")
+    if res.temperature is not None:
+        lines.append(f"• Temperature: {res.temperature} °C")
+    if res.respiratory_rate is not None:
+        lines.append(f"• Respiratory Rate: {res.respiratory_rate} breaths/min")
+
+    if res.flags:
+        lines.append("\nClinical Observations:")
+        for f in res.flags:
+            badge = "⚠️ " if f.status in ("elevated", "high", "critical_high", "critical_low") else "ℹ️ "
+            lines.append(f"  {badge}{f.message}")
+
+    return "\n".join(lines)
+
+
+async def _tool_get_latest_vitals(uid: str, db: firestore.AsyncClient) -> str:
+    from patient_service.vitals.vitals_func import get_latest_vitals
+    vitals = await get_latest_vitals(uid, db)
+    if not vitals:
+        return "No vitals recorded yet. You can log them by asking me (e.g. 'Add weight 65kg', 'Log BP 120/80')."
+
+    lines = ["Here are your latest recorded vitals:\n"]
+    for v in vitals:
+        v_name = v.vital_type.replace("_", " ").title()
+        date_str = v.measured_at.astimezone(IST).strftime("%d %b %Y, %I:%M %p IST") if v.measured_at else "Recent"
+        val_str = ", ".join(f"{k}: {val}" for k, val in v.values.items())
+        lines.append(f"• {v_name}: {val_str} (recorded on {date_str})")
+        if v.flags:
+            for f in v.flags:
+                lines.append(f"  - {f.message}")
+    return "\n".join(lines)
+
+
+async def _tool_get_vital_trend(uid: str, args: dict, db: firestore.AsyncClient) -> str:
+    from patient_service.vitals.vitals_func import get_vital_trend
+    vtype = args.get("vital_type", "blood_pressure")
+    days = int(args.get("days", 30))
+    trend = await get_vital_trend(uid, vtype, days, db)
+    if not trend.points:
+        return f"No readings found for {vtype.replace('_', ' ')} in the last {days} days."
+
+    lines = [f"Trend for {vtype.replace('_', ' ').title()} (Past {days} days):\n"]
+    for p in trend.points:
+        dt_str = p.measured_at.astimezone(IST).strftime("%d %b %Y %I:%M %p") if p.measured_at else ""
+        vals = ", ".join(f"{k}: {v}" for k, v in p.values.items())
+        lines.append(f"• {dt_str}: {vals} {trend.unit}")
+    return "\n".join(lines)
 
 
 async def _tool_list_documents(uid: str, db: firestore.AsyncClient) -> str:
@@ -293,7 +492,6 @@ async def _tool_create_reminder(uid: str, args: dict, db: firestore.AsyncClient)
     rtype     = ReminderType.follow_up if "follow" in rtype_str else ReminderType.medicine
 
     recurrence_str = args.get("recurrence", "daily").lower()
-    # Follow-ups default to once
     if rtype == ReminderType.follow_up and not args.get("recurrence"):
         recurrence_str = "once"
     try:
@@ -355,7 +553,6 @@ async def _tool_create_reminder(uid: str, args: dict, db: firestore.AsyncClient)
             appointment_time=args.get("appointment_time") or args.get("time_of_day"),
         )
 
-    # Derive a sensible default title if Gemini didn't extract one
     if meal_timing:
         timing_label = meal_timing.value.replace("_", " ")
     else:
@@ -440,7 +637,6 @@ async def _tool_list_consultations(uid: str, db: firestore.AsyncClient) -> str:
             icd_strs = [f"{i.code} ({i.description})" for i in c.icd_codes]
             lines.append(f"  ICD codes: {', '.join(icd_strs)}")
         if c.summary:
-            # Truncate summary to keep chatbot response concise
             summary_preview = c.summary[:120].rstrip()
             if len(c.summary) > 120:
                 summary_preview += "..."
@@ -461,7 +657,7 @@ async def _tool_get_consultation(uid: str, args: dict, db: firestore.AsyncClient
     date = c.created_at.astimezone(IST).strftime("%d %b %Y") if c.created_at else "Unknown date"
     lines = [
         f"Consultation: {c.title or 'Untitled'} ({date})",
-        f"Status: {c.status.value} | Language: {c.language.value if hasattr(c.language, 'value') else c.language}",
+        f"Status: {c.status.value} | Language: {c.language.value if hasattr(c.language, "value") else c.language}",
     ]
     if c.doctor_name:
         lines.append(f"Doctor: {c.doctor_name}")
@@ -496,50 +692,46 @@ async def try_tool_call(
     today: str,
 ) -> Optional[tuple]:
     """
-    Sends the prompt to Gemini with tools enabled.
+    Sends the prompt and conversation history to Gemini with tool calling enabled.
 
-    Returns one of three values:
+    Returns:
     - ("tool", tool_name, args_dict) — Gemini selected a tool to execute
-    - ("text", message)              — Gemini is asking a clarifying question
-                                       (e.g. "What medicine is this for?")
-    - None                           — not a tool action; let RAG handle it
-
-    The PASS sentinel in the system instruction lets Gemini explicitly signal
-    "this is a medical/general question" without generating a full text reply,
-    so we can cleanly fall through to the RAG path.
+    - ("text", clarifying_question)  — Gemini needs clarification from the patient
+    - None                           — General question / RAG path
     """
     from common_code.gcp_clients import _get_genai
 
     system_instruction = (
         f"You are an AI Health Companion assistant. Today is {today} (IST, Asia/Kolkata).\n\n"
-        "Your ONLY job here is to handle tool actions and gather details for them.\n"
+        "Your role is to understand user health queries, execute tools when asked to perform actions, "
+        "or ask clarifying questions if details are missing.\n\n"
         "Respond in exactly ONE of three ways:\n\n"
         "━━ WAY 1: CALL A TOOL ━━\n"
-        "When you have all required details, call the appropriate tool:\n"
-        "• Patient wants to list/show documents → list_documents\n"
-        "• Patient wants to list/show reminders → list_reminders (pass status filter if mentioned)\n"
-        "• Patient wants to create a reminder AND you have: title + timing + recurrence → create_reminder\n"
-        "  - Timing: use meal_timing (e.g. 'before_breakfast') if the patient mentions a meal; otherwise use time_of_day (HH:MM).\n"
-        "  - Use today's date as start_date unless patient specifies one.\n"
-        "  - type: 'medicine' for medication reminders, 'follow_up' for doctor/appointment reminders.\n"
-        "  - For follow_up: capture appointment_date and appointment_time if mentioned.\n"
-        "• Patient wants to delete/cancel a reminder → delete_reminder (call list_reminders first if ID unknown)\n"
-        "• Patient wants to pause/resume/modify a reminder → update_reminder\n"
-        "• Patient wants to list/show consultations, doctor visits, or recordings → list_consultations\n"
-        "• Patient wants details of a specific consultation → get_consultation (call list_consultations first if ID unknown)\n\n"
+        "When the patient requests an action and you have sufficient parameters, call the tool:\n"
+        "• LOG VITALS (weight, BP, heart rate, blood sugar, SpO2, temperature, height, respiratory rate) → log_vitals\n"
+        "  - e.g. 'Add weight 50kg' → log_vitals(weight=50)\n"
+        "  - e.g. 'Record BP 125/82' → log_vitals(systolic=125, diastolic=82)\n"
+        "  - e.g. 'My fasting sugar is 95' → log_vitals(glucose_fasting=95)\n"
+        "  - e.g. 'My temperature is 99 F' → log_vitals(temperature=99.0)\n"
+        "• GET LATEST VITALS → get_latest_vitals\n"
+        "• GET VITAL TREND → get_vital_trend(vital_type=..., days=...)\n"
+        "• LIST DOCUMENTS → list_documents\n"
+        "• LIST REMINDERS → list_reminders\n"
+        "• CREATE REMINDER → create_reminder (requires title, time/timing, recurrence, start_date)\n"
+        "• DELETE / CANCEL REMINDER → delete_reminder\n"
+        "• UPDATE / PAUSE REMINDER → update_reminder\n"
+        "• LIST CONSULTATIONS → list_consultations\n"
+        "• GET CONSULTATION DETAILS → get_consultation\n\n"
         "━━ WAY 2: ASK ONE CLARIFYING QUESTION ━━\n"
-        "If the patient wants to create a reminder but a required detail is missing, ask exactly ONE question:\n"
-        "  Missing title/purpose? → Ask: 'What is this reminder for? (e.g. medicine name or appointment)'\n"
-        "  Medicine type but no medicine name? → Ask: 'What is the medicine name and dosage?'\n"
-        "  No time specified? → Ask: 'When would you like the reminder? You can say a specific time (e.g. 9 AM) or relative to a meal (e.g. before breakfast, after lunch).'\n"
-        "  No recurrence? → Ask: 'Should this repeat daily, weekly, or just once?'\n"
-        "  Missing end date for medicine course? → Ask: 'How long should this reminder continue? Or should it repeat indefinitely?'\n"
-        "  Follow-up but no appointment date/time? → Ask: 'What is the appointment date and time?'\n"
-        "Ask only ONE question per turn. Be brief and friendly.\n\n"
+        "If the patient wants to log a vital or create a reminder but a critical value is missing:\n"
+        "  - Said 'Log my blood pressure' but no numbers? → Ask: 'What was your blood pressure reading? (e.g. 120/80 mmHg)'\n"
+        "  - Said 'Log my blood sugar' but no value? → Ask: 'What was your blood sugar reading in mg/dL, and was it fasting or after a meal?'\n"
+        "  - Said 'Record my weight' but no number? → Ask: 'What is your current body weight in kg?'\n"
+        "  - Said 'Set a medicine reminder' but no medicine or time? → Ask: 'What medicine would you like a reminder for, and at what time or meal?'\n"
+        "Ask only ONE concise, friendly question per turn.\n\n"
         "━━ WAY 3: RESPOND WITH EXACTLY THE WORD 'PASS' ━━\n"
-        "For everything else — medical questions, health advice, greetings, report explanations — "
-        "respond with only the single word: PASS\n\n"
-        "NEVER provide medical advice here. NEVER respond with more than one clarifying question."
+        "For medical explanations, health questions, symptoms, or greetings, respond with ONLY the word: PASS\n"
+        "NEVER provide medical advice here. If it is a health question, output PASS so RAG grounds it."
     )
 
     user_turn = prompt
@@ -555,6 +747,7 @@ async def try_tool_call(
                 system_instruction=system_instruction,
                 tools=[CHATBOT_TOOLS],
                 tool_config=_TOOL_CONFIG,
+                automatic_function_calling=genai_types.AutomaticFunctionCallingConfig(disable=True),
             ),
         )
 
@@ -564,14 +757,12 @@ async def try_tool_call(
             return None
         parts = response.candidates[0].content.parts
 
-        # Check for a function call first
         for part in parts:
             if hasattr(part, "function_call") and part.function_call:
                 fc = part.function_call
                 logger.info(f"Tool selected: {fc.name} args={dict(fc.args)}")
                 return "tool", fc.name, dict(fc.args)
 
-        # No function call — check if Gemini returned a clarifying question or PASS
         text_parts = [p.text for p in parts if hasattr(p, "text") and p.text]
         text = " ".join(text_parts).strip()
         if not text or text.strip().upper() == "PASS":

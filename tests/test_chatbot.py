@@ -218,3 +218,96 @@ def test_chatbot_voice_websocket(client, mock_db, mock_user, mock_ai):
             voice_bytes_text = websocket.receive_bytes()
             assert voice_bytes_text == b"SYNTHESIZED_MP3_SPEECH"
 
+
+def test_chatbot_log_vitals_tool(client, mock_db, mock_user):
+    now = datetime.datetime.now(datetime.UTC)
+    mock_db.db_store[settings.CHAT_SESSIONS_COLLECTION] = {
+        "session-vitals": {
+            "id": "session-vitals",
+            "patient_id": mock_user["uid"],
+            "title": "Vitals Session",
+            "created_at": now,
+            "updated_at": now,
+            "messages": []
+        }
+    }
+
+    with patch("patient_service.chatbot.chatbot_func.try_tool_call") as mock_tool_call, \
+         patch("patient_service.chatbot.chatbot_func.async_generate_gemini_content") as mock_gemini:
+        # Mock Gemini selecting the log_vitals tool with weight=50kg
+        mock_tool_call.return_value = ("tool", "log_vitals", {"weight": 50.0, "notes": "From chat"})
+        mock_gemini.return_value = "I have recorded your weight as 50.0 kg."
+
+        response = client.post("/chatbot/sessions/session-vitals/ask", json={"prompt": "Add weight 50kg"})
+        assert response.status_code == 200
+        data = response.json()
+        assert "50.0 kg" in data["reply"]
+
+        # Verify that the vital was actually saved in VITALS_COLLECTION
+        vitals_store = mock_db.db_store.get(settings.VITALS_COLLECTION, {})
+        assert len(vitals_store) >= 1
+        vital_record = list(vitals_store.values())[0]
+        assert vital_record["patientId"] == mock_user["uid"]
+        assert vital_record["weight"] == 50.0
+
+
+def test_chatbot_clarification_flow(client, mock_db, mock_user):
+    now = datetime.datetime.now(datetime.UTC)
+    mock_db.db_store[settings.CHAT_SESSIONS_COLLECTION] = {
+        "session-clarify": {
+            "id": "session-clarify",
+            "patient_id": mock_user["uid"],
+            "title": "Clarify Session",
+            "created_at": now,
+            "updated_at": now,
+            "messages": []
+        }
+    }
+
+    with patch("patient_service.chatbot.chatbot_func.try_tool_call") as mock_tool_call:
+        # Mock Gemini asking for clarification because no number was given
+        mock_tool_call.return_value = ("text", "What was your blood pressure reading? (e.g. 120/80 mmHg)")
+
+        response = client.post("/chatbot/sessions/session-clarify/ask", json={"prompt": "Record my blood pressure"})
+        assert response.status_code == 200
+        data = response.json()
+        assert "120/80" in data["reply"]
+
+
+def test_chatbot_stream_thinking_events(client, mock_db, mock_user):
+    now = datetime.datetime.now(datetime.UTC)
+    mock_db.db_store[settings.CHAT_SESSIONS_COLLECTION] = {
+        "session-stream": {
+            "id": "session-stream",
+            "patient_id": mock_user["uid"],
+            "title": "Stream Session",
+            "created_at": now,
+            "updated_at": now,
+            "messages": []
+        }
+    }
+
+    with patch("patient_service.chatbot.chatbot_func.try_tool_call") as mock_tool_call, \
+         patch("patient_service.chatbot.chatbot_func.stream_gemini_content") as mock_stream:
+        # Mock tool call
+        mock_tool_call.return_value = ("tool", "log_vitals", {"systolic": 120, "diastolic": 80})
+
+        async def _mock_stream_generator(prompt, model=None):
+            yield "Your blood pressure "
+            yield "120/80 mmHg "
+            yield "is recorded."
+
+        mock_stream.side_effect = _mock_stream_generator
+
+        response = client.post(
+            "/chatbot/sessions/session-stream/ask/stream",
+            json={"prompt": "My BP is 120/80"}
+        )
+        assert response.status_code == 200
+        content = response.text
+        assert "thinking" in content
+        assert "tool_call" in content
+        assert "tool_result" in content
+        assert "chunk" in content
+        assert "done" in content
+

@@ -33,7 +33,7 @@ try:
     from patient_service.app import app as patient_app
     print("✓ patient_service.app successfully initialized.")
     
-    from patient_service.auth.auth_model import PatientRegisterRequest
+    from patient_service.auth.auth_model import PatientRegisterRequest, UserUpdateRequest
     from patient_service.profile.profile_model import PatientProfileUpdateRequest
     from patient_service.profile.profile_func import compute_indian_bmi_category
     

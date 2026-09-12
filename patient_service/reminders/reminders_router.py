@@ -218,12 +218,19 @@ async def legacy_trigger_notification(
 @router.post("/pubsub-handler", status_code=status.HTTP_200_OK)
 async def pubsub_handler(
     envelope: PubSubEnvelope,
+    x_pubsub_secret: Optional[str] = Header(None, alias="X-PubSub-Secret"),
     db: firestore.AsyncClient = Depends(get_db),
 ):
     """
     Pub/Sub push handler for consultation-published events.
     Auto-creates medicine and follow-up reminders from consultation suggestion payloads.
+    Authenticates via X-PubSub-Secret header in non-local environments.
     """
+    expected = settings.PUBSUB_VERIFICATION_SECRET or settings.CLOUD_TASKS_SECRET or "local-pubsub-secret"
+    if settings.ENVIRONMENT != "local":
+        if not x_pubsub_secret or x_pubsub_secret != expected:
+            raise HTTPException(status_code=401, detail="Unauthorized Pub/Sub request.")
+
     try:
         decoded  = base64.b64decode(envelope.message.data)
         payload  = json.loads(decoded.decode("utf-8"))

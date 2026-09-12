@@ -288,4 +288,94 @@ def test_non_prescription_document_returns_no_reminder_suggestions(client, mock_
         detail_response = client.get(f"/documents/{doc_id}")
         assert detail_response.status_code == 200
         assert detail_response.json()["reminder_suggestions"] == []
+
+
+def test_sanitize_firestore_payload_handles_date():
+    import datetime
+    from common_code.firestore import sanitize_firestore_payload
+    from pydantic import BaseModel
+
+    class MockItem(BaseModel):
+        dt: datetime.date
+        name: str
+
+    raw = {
+        "date_field": datetime.date(2026, 8, 16),
+        "datetime_field": datetime.datetime(2026, 8, 16, 12, 0, 0, tzinfo=datetime.timezone.utc),
+        "nested_list": [
+            datetime.date(2026, 9, 1),
+            {"inner_date": datetime.date(2026, 10, 15)}
+        ],
+        "pydantic_obj": MockItem(dt=datetime.date(2026, 11, 20), name="test")
+    }
+
+    sanitized = sanitize_firestore_payload(raw)
+
+    assert sanitized["date_field"] == "2026-08-16"
+    assert isinstance(sanitized["datetime_field"], datetime.datetime)
+    assert sanitized["nested_list"][0] == "2026-09-01"
+    assert sanitized["nested_list"][1]["inner_date"] == "2026-10-15"
+    assert sanitized["pydantic_obj"]["dt"] == "2026-11-20"
+
+
+def test_prescription_reminder_suggestions_date_serialization(client, mock_db, mock_user, mock_gcp_services):
+    presc_text = "Doctor prescription: Tab. Amoxicillin 500mg once daily for 5 days."
+    gemini_payload = {
+        "category": "prescription",
+        "title": "Amoxicillin Prescription",
+        "summary": "Take Amoxicillin 500mg daily for 5 days.",
+        "doctor_name": "Dr. Sharma",
+        "document_date": "2026-08-16",
+        "patient_name": "Test Patient",
+        "medications": [{"name": "Amoxicillin", "dosage": "500mg", "frequency": "daily", "instructions": "after breakfast"}],
+        "abnormal_labs": [],
+        "red_flags": [],
+        "actionable_steps": ["Complete 5-day course"],
+        "reminder_suggestions": [
+            {
+                "type": "medicine",
+                "title": "Take Amoxicillin",
+                "notes": None,
+                "notification_enabled": True,
+                "schedule": {
+                    "recurrence": "daily",
+                    "time_of_day": "09:00",
+                    "start_date": None,
+                    "end_date": None,
+                    "meal_timing": "after_breakfast"
+                },
+                "medicine_details": {
+                    "name": "Amoxicillin",
+                    "dosage": "500mg",
+                    "frequency": "daily",
+                    "instructions": "after breakfast",
+                    "duration": "5 days"
+                },
+                "follow_up_details": None
+            }
+        ]
+    }
+    mock_gcp_services["parse"].return_value = presc_text
+    mock_gcp_services["gemini"].return_value = json.dumps(gemini_payload)
+
+    file_content = b"%PDF-1.4 mock prescription pdf"
+    files = {"file": ("prescription.pdf", file_content, "application/pdf")}
+
+    with patch("common_code.notification_dispatcher.dispatch_notification") as mock_dispatch:
+        mock_dispatch.return_value = True
+
+        response = client.post("/documents/upload", files=files, data={})
+        assert response.status_code == 201
+        doc_id = response.json()["id"]
+
+        doc_record = mock_db.db_store[settings.DOCUMENTS_COLLECTION][doc_id]
+        assert doc_record["status"] == "completed"
+        assert doc_record["type"] == "prescription"
+        suggestions = doc_record["reminder_suggestions"]
+        assert len(suggestions) == 1
+        sched = suggestions[0]["schedule"]
+        # Verify dates are strings, not datetime.date objects
+        assert isinstance(sched["start_date"], str)
+        assert isinstance(sched["end_date"], str)
+
  

@@ -51,9 +51,12 @@ async def _fetch_latest_vitals(uid: str, db: firestore.AsyncClient) -> Optional[
 
 
 async def _fetch_profile_name(uid: str, db: firestore.AsyncClient) -> Optional[str]:
-    snap = await db.collection(settings.PATIENTS_COLLECTION).document(uid).get()
-    if snap.exists:
-        return (snap.to_dict() or {}).get("name")
+    snap = await db.collection(settings.USERS_COLLECTION).document(uid).get()
+    if snap.exists and (name := (snap.to_dict() or {}).get("name")):
+        return name
+    patient_snap = await db.collection(settings.PATIENTS_COLLECTION).document(uid).get()
+    if patient_snap.exists:
+        return (patient_snap.to_dict() or {}).get("name")
     return None
 
 

@@ -110,7 +110,8 @@ def test_qr_passport(client, mock_db, mock_user):
     mock_db.db_store[settings.USERS_COLLECTION] = {
         mock_user["uid"]: {
             "uid": mock_user["uid"],
-            "name": "Arjun Kumar"
+            "name": "Arjun Kumar",
+            "email": "arjun.kumar@example.com"
         }
     }
     mock_db.db_store[settings.PATIENTS_COLLECTION] = {
@@ -127,11 +128,16 @@ def test_qr_passport(client, mock_db, mock_user):
     assert response.status_code == 200
     data = response.json()
     assert data["name"] == "Arjun Kumar"
+    assert data["email"] == "arjun.kumar@example.com"
     assert data["blood_group"] == "A-"
     assert "Shellfish" in data["allergies"]
     assert data["emergency_contact"]["name"] == "Wife"
+    assert data["validity_minutes"] == 30
+    assert "token" in data
+    assert "token_expires_at" in data
     assert "qr_redirect_url" in data
-    assert f"/profile/sos/{mock_user['uid']}" in data["qr_redirect_url"]
+    assert "https://medhx-ai.vercel.app/doctor-view?token=" in data["qr_redirect_url"]
+    assert "arjun.kumar%40example.com" in data["qr_redirect_url"] or "arjun.kumar@example.com" in data["qr_redirect_url"]
 
 def test_patient_onboarding_skip(client, mock_db, mock_user):
     # Initialize basic registration status in DB
@@ -188,7 +194,8 @@ def test_patient_onboarding_continue_success(client, mock_db, mock_user):
     payload = {
         "skip": False,
         "name": "Arjun Kumar Updated",
-        "phone": "+919876543210",
+        "country_code": "+91",
+        "phone_number": "9876543210",
         "language_preference": "hi",
         "date_of_birth": "1990-05-15",
         "gender": "Male",
@@ -242,7 +249,8 @@ def test_patient_onboarding_continue_validation_errors(client, mock_db, mock_use
     # Missing date_of_birth and gender
     payload_missing = {
         "skip": False,
-        "phone": "+919876543210",
+        "country_code": "+91",
+        "phone_number": "9876543210",
         "allergies": [],
         "height": 180.0,
         "weight": 75.0
@@ -254,7 +262,8 @@ def test_patient_onboarding_continue_validation_errors(client, mock_db, mock_use
     # Invalid DOB format
     payload_invalid_dob = {
         "skip": False,
-        "phone": "+919876543210",
+        "country_code": "+91",
+        "phone_number": "9876543210",
         "date_of_birth": "15-05-1990", # invalid
         "gender": "Male",
         "allergies": [],
@@ -268,7 +277,8 @@ def test_patient_onboarding_continue_validation_errors(client, mock_db, mock_use
     # Future DOB
     payload_future_dob = {
         "skip": False,
-        "phone": "+919876543210",
+        "country_code": "+91",
+        "phone_number": "9876543210",
         "date_of_birth": "2050-01-01", # future
         "gender": "Male",
         "allergies": [],
@@ -309,33 +319,102 @@ def test_update_fcm_token(client, mock_db, mock_user):
     assert user_record.get("fcm_tokens", {}).get("android") == "mock-fcm-token-android"
 
 
-def test_public_sos_landing_page(client, mock_db, mock_user):
+
+
+def test_get_profile_returns_deletion_status_and_scheduled_time(client, mock_db, mock_user):
+    uid = mock_user["uid"]
+    sched_time = datetime.datetime.now(datetime.UTC) + datetime.timedelta(hours=48)
     mock_db.db_store[settings.USERS_COLLECTION] = {
-        "emergency-patient-abc": {
-            "uid": "emergency-patient-abc",
-            "name": "Emergency Patient"
+        uid: {
+            "uid": uid,
+            "name": "Deletion User",
+            "email": "user@example.com",
+            "account_status": "pending_deletion",
+            "deletion_scheduled_at": sched_time,
         }
     }
     mock_db.db_store[settings.PATIENTS_COLLECTION] = {
-        "emergency-patient-abc": {
-            "blood_group": "AB-",
-            "allergies": ["Nuts"],
-            "chronic_conditions": ["Diabetes"],
-            "current_medications": ["Insulin"],
+        uid: {
+            "blood_group": "B+",
+            "allergies": [],
+            "chronic_conditions": [],
+            "current_medications": [],
             "meal_times": {},
-            "emergency_contact": {"name": "Father", "phone": "+919999900000"}
         }
     }
-    
-    response = client.get("/profile/sos/emergency-patient-abc")
-    assert response.status_code == 200
-    assert response.headers["content-type"] == "text/html; charset=utf-8"
-    html_text = response.text
-    assert "Emergency Patient" in html_text
-    assert "AB-" in html_text
-    assert "Nuts" in html_text
-    assert "Diabetes" in html_text
-    assert "Insulin" in html_text
-    assert "Father" in html_text
-    assert "+919999900000" in html_text
+
+    resp = client.get("/profile")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["account_status"] == "pending_deletion"
+    assert data["deletion_scheduled_at"] is not None
+
+
+def test_doctor_view_verify_success_and_failures(client, mock_db, mock_user):
+    import jwt
+    uid = mock_user["uid"]
+    email = "doctor.patient@example.com"
+
+    mock_db.db_store[settings.USERS_COLLECTION] = {
+        uid: {
+            "uid": uid,
+            "name": "Doctor Patient",
+            "email": email,
+            "phone": "+919876543210",
+            "role": "patient",
+            "language_preference": "en",
+            "onboarding_status": "completed",
+        }
+    }
+    mock_db.db_store[settings.PATIENTS_COLLECTION] = {
+        uid: {
+            "age": 42,
+            "gender": "Female",
+            "blood_group": "B+",
+            "allergies": ["Penicillin"],
+            "chronic_conditions": ["Type 2 Diabetes"],
+            "current_medications": ["Metformin 500mg"],
+            "meal_times": {},
+            "emergency_contact": {"name": "Husband", "phone": "+919876543211"}
+        }
+    }
+
+    # 1. Get passport to get a fresh 30-min token
+    pass_resp = client.get("/profile/passport")
+    assert pass_resp.status_code == 200
+    token = pass_resp.json()["token"]
+
+    # 2. Public POST verify with matching email
+    verify_resp = client.post("/profile/sos/verify", json={"token": token, "email": email})
+    assert verify_resp.status_code == 200
+    doc_data = verify_resp.json()
+    assert doc_data["valid"] is True
+    assert doc_data["patient_id"] == uid
+    assert doc_data["name"] == "Doctor Patient"
+    assert doc_data["email"] == email
+    assert doc_data["age"] == 42
+    assert doc_data["blood_group"] == "B+"
+    assert "Penicillin" in doc_data["allergies"]
+    assert "Type 2 Diabetes" in doc_data["chronic_conditions"]
+    assert doc_data["remaining_seconds"] > 0
+
+    # 3. Verification with wrong email -> 403 Forbidden
+    bad_email_resp = client.post("/profile/sos/verify", json={"token": token, "email": "wrong@example.com"})
+    assert bad_email_resp.status_code == 403
+    assert "Email mismatch" in bad_email_resp.json()["detail"]
+
+    # 5. Verification with expired token -> 401 Unauthorized
+    expired_payload = {
+        "sub": uid,
+        "email": email,
+        "type": "qr_passport",
+        "iat": int((datetime.datetime.now(datetime.UTC) - datetime.timedelta(hours=2)).timestamp()),
+        "exp": int((datetime.datetime.now(datetime.UTC) - datetime.timedelta(hours=1)).timestamp()),
+    }
+    expired_token = jwt.encode(expired_payload, settings.QR_PASSPORT_SECRET, algorithm="HS256")
+    exp_resp = client.post("/profile/sos/verify", json={"token": expired_token, "email": email})
+    assert exp_resp.status_code == 401
+    assert "expired" in exp_resp.json()["detail"].lower()
+
+
 

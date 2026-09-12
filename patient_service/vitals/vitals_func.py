@@ -1,5 +1,6 @@
 import datetime
-from typing import Optional
+from datetime import timezone, timedelta
+from typing import List, Optional, Tuple
 from google.cloud import firestore
 
 from common_code.config import settings
@@ -10,12 +11,13 @@ from patient_service.vitals.vitals_model import (
     VitalTrendPoint,
     VitalTrendResponse,
     VitalType,
+    VitalsListResponse,
     VitalsLogRequest,
     VitalsLogResponse,
 )
 
 
-# ── Reference range checkers (Indian standards) ────────────────────────────────
+# ── Reference range checkers (Indian clinical standards) ──────────────────────
 
 def _flag(vital: str, value: float, status: str, message: str) -> VitalFlag:
     return VitalFlag(vital=vital, value=value, status=status, message=message)
@@ -26,7 +28,7 @@ def _check_bp(systolic: Optional[int], diastolic: Optional[int]) -> list[VitalFl
     if systolic is not None:
         if systolic >= 180:
             flags.append(_flag("systolic", systolic, "critical_high",
-                               "Hypertensive crisis (≥180 mmHg) — seek immediate care"))
+                               "Hypertensive crisis (≥180 mmHg) — seek immediate medical attention"))
         elif systolic >= 140:
             flags.append(_flag("systolic", systolic, "high",
                                "Stage 2 hypertension (140–179 mmHg)"))
@@ -101,7 +103,7 @@ def _check_respiratory(rr: int) -> VitalFlag:
 
 def _check_glucose_fasting(g: float) -> VitalFlag:
     if g < 70:
-        return _flag("glucose_fasting", g, "critical_low", "Hypoglycaemia (<70 mg/dL) — act immediately")
+        return _flag("glucose_fasting", g, "critical_low", "Hypoglycaemia (<70 mg/dL) — take fast-acting sugar")
     elif g <= 100:
         return _flag("glucose_fasting", g, "normal", "Normal fasting glucose (70–100 mg/dL)")
     elif g <= 125:
@@ -129,101 +131,6 @@ def _check_glucose_random(g: float) -> VitalFlag:
     return _flag("glucose_random", g, "high", "Diabetic range random glucose (≥200 mg/dL)")
 
 
-def _check_hba1c(h: float) -> VitalFlag:
-    if h < 5.7:
-        return _flag("hba1c", h, "normal", "Normal HbA1c (<5.7%)")
-    elif h < 6.5:
-        return _flag("hba1c", h, "elevated", "Pre-diabetic HbA1c (5.7–6.4%)")
-    return _flag("hba1c", h, "high", "Diabetic range HbA1c (≥6.5%)")
-
-
-def _check_cholesterol_total(c: float) -> VitalFlag:
-    if c < 200:
-        return _flag("cholesterol_total", c, "normal", "Desirable total cholesterol (<200 mg/dL)")
-    elif c < 240:
-        return _flag("cholesterol_total", c, "elevated", "Borderline high cholesterol (200–239 mg/dL)")
-    return _flag("cholesterol_total", c, "high", "High cholesterol (≥240 mg/dL)")
-
-
-def _check_ldl(ldl: float) -> VitalFlag:
-    if ldl < 100:
-        return _flag("cholesterol_ldl", ldl, "normal", "Optimal LDL (<100 mg/dL)")
-    elif ldl < 130:
-        return _flag("cholesterol_ldl", ldl, "normal", "Near-optimal LDL (100–129 mg/dL)")
-    elif ldl < 160:
-        return _flag("cholesterol_ldl", ldl, "elevated", "Borderline high LDL (130–159 mg/dL)")
-    elif ldl < 190:
-        return _flag("cholesterol_ldl", ldl, "high", "High LDL (160–189 mg/dL)")
-    return _flag("cholesterol_ldl", ldl, "critical_high", "Very high LDL (≥190 mg/dL)")
-
-
-def _check_hdl(hdl: float) -> VitalFlag:
-    if hdl < 40:
-        return _flag("cholesterol_hdl", hdl, "low", "Low HDL — increased cardiac risk (<40 mg/dL)")
-    elif hdl >= 60:
-        return _flag("cholesterol_hdl", hdl, "normal", "Protective HDL (≥60 mg/dL)")
-    return _flag("cholesterol_hdl", hdl, "normal", "Acceptable HDL (40–59 mg/dL)")
-
-
-def _check_triglycerides(tg: float) -> VitalFlag:
-    if tg < 150:
-        return _flag("triglycerides", tg, "normal", "Normal triglycerides (<150 mg/dL)")
-    elif tg < 200:
-        return _flag("triglycerides", tg, "elevated", "Borderline high triglycerides (150–199 mg/dL)")
-    elif tg < 500:
-        return _flag("triglycerides", tg, "high", "High triglycerides (200–499 mg/dL)")
-    return _flag("triglycerides", tg, "critical_high", "Very high triglycerides (≥500 mg/dL)")
-
-
-def _check_uric_acid(ua: float) -> VitalFlag:
-    if ua > 7.0:
-        return _flag("uric_acid", ua, "high", "High uric acid — gout risk (>7.0 mg/dL)")
-    elif ua < 3.0:
-        return _flag("uric_acid", ua, "low", "Low uric acid (<3.0 mg/dL)")
-    return _flag("uric_acid", ua, "normal", "Normal uric acid (3.0–7.0 mg/dL)")
-
-
-def _check_creatinine(cr: float) -> VitalFlag:
-    if cr > 1.2:
-        return _flag("creatinine", cr, "high", "Elevated creatinine — possible kidney strain (>1.2 mg/dL)")
-    elif cr < 0.5:
-        return _flag("creatinine", cr, "low", "Low creatinine (<0.5 mg/dL)")
-    return _flag("creatinine", cr, "normal", "Normal creatinine (0.5–1.2 mg/dL)")
-
-
-def _check_egfr(egfr: float) -> VitalFlag:
-    if egfr >= 90:
-        return _flag("egfr", egfr, "normal", "Normal kidney function (≥90 mL/min/1.73m²)")
-    elif egfr >= 60:
-        return _flag("egfr", egfr, "elevated", "Mildly reduced kidney function (60–89)")
-    elif egfr >= 30:
-        return _flag("egfr", egfr, "high", "Moderately reduced kidney function (30–59)")
-    return _flag("egfr", egfr, "critical_low", "Severely reduced kidney function (<30)")
-
-
-def _check_hemoglobin(hb: float) -> VitalFlag:
-    if hb < 8:
-        return _flag("hemoglobin", hb, "critical_low",
-                     "Severe anaemia (<8 g/dL) — consult doctor urgently")
-    elif hb < 12:
-        return _flag("hemoglobin", hb, "low",
-                     "Anaemia (<12 g/dL) — common in India; check iron and B12 levels")
-    elif hb <= 17:
-        return _flag("hemoglobin", hb, "normal", "Normal haemoglobin (12–17 g/dL)")
-    return _flag("hemoglobin", hb, "high", "Elevated haemoglobin (>17 g/dL)")
-
-
-def _check_waist(wc: float) -> VitalFlag:
-    # Indian cut-offs: men >90 cm, women >80 cm
-    if wc > 90:
-        return _flag("waist_circumference", wc, "high",
-                     "High abdominal obesity (Indian cut-off: >90 cm men, >80 cm women)")
-    elif wc > 80:
-        return _flag("waist_circumference", wc, "elevated",
-                     "Borderline abdominal obesity (Indian cut-off: >80 cm women)")
-    return _flag("waist_circumference", wc, "normal", "Within healthy waist range")
-
-
 # ── BMI (Indian cut-offs) ──────────────────────────────────────────────────────
 
 def _compute_bmi(weight: float, height: float) -> tuple[float, str]:
@@ -239,38 +146,26 @@ def _compute_bmi(weight: float, height: float) -> tuple[float, str]:
     return bmi, category
 
 
-# ── Vital type → field mapping ─────────────────────────────────────────────────
+# ── Vital type mappings ────────────────────────────────────────────────────────
 
 VITAL_FIELD_MAP: dict[str, list[str]] = {
-    VitalType.blood_pressure:      ["systolic", "diastolic"],
-    VitalType.blood_glucose:       ["glucose_fasting", "glucose_post_meal", "glucose_random"],
-    VitalType.heart_rate:          ["heart_rate"],
-    VitalType.spo2:                ["spo2"],
-    VitalType.temperature:         ["temperature"],
-    VitalType.weight_bmi:          ["weight", "height", "bmi", "bmi_category"],
-    VitalType.respiratory_rate:    ["respiratory_rate"],
-    VitalType.hba1c:               ["hba1c"],
-    VitalType.cholesterol:         ["cholesterol_total", "cholesterol_ldl", "cholesterol_hdl", "triglycerides"],
-    VitalType.uric_acid:           ["uric_acid"],
-    VitalType.creatinine:          ["creatinine", "egfr"],
-    VitalType.hemoglobin:          ["hemoglobin"],
-    VitalType.waist_circumference: ["waist_circumference"],
+    VitalType.blood_pressure:   ["systolic", "diastolic"],
+    VitalType.blood_glucose:    ["glucose_fasting", "glucose_post_meal", "glucose_random"],
+    VitalType.heart_rate:       ["heart_rate"],
+    VitalType.spo2:             ["spo2"],
+    VitalType.temperature:      ["temperature"],
+    VitalType.weight_bmi:       ["weight", "height", "bmi", "bmi_category"],
+    VitalType.respiratory_rate: ["respiratory_rate"],
 }
 
 VITAL_UNITS: dict[str, str] = {
-    VitalType.blood_pressure:      "mmHg",
-    VitalType.blood_glucose:       "mg/dL",
-    VitalType.heart_rate:          "bpm",
-    VitalType.spo2:                "%",
-    VitalType.temperature:         "°C",
-    VitalType.weight_bmi:          "kg / BMI",
-    VitalType.respiratory_rate:    "breaths/min",
-    VitalType.hba1c:               "%",
-    VitalType.cholesterol:         "mg/dL",
-    VitalType.uric_acid:           "mg/dL",
-    VitalType.creatinine:          "mg/dL",
-    VitalType.hemoglobin:          "g/dL",
-    VitalType.waist_circumference: "cm",
+    VitalType.blood_pressure:   "mmHg",
+    VitalType.blood_glucose:    "mg/dL",
+    VitalType.heart_rate:       "bpm",
+    VitalType.spo2:             "%",
+    VitalType.temperature:      "°C",
+    VitalType.weight_bmi:       "kg / BMI",
+    VitalType.respiratory_rate: "breaths/min",
 }
 
 
@@ -300,26 +195,6 @@ def _compute_flags(req: VitalsLogRequest) -> list[VitalFlag]:
         flags.append(_check_glucose_post_meal(req.glucose_post_meal))
     if req.glucose_random is not None:
         flags.append(_check_glucose_random(req.glucose_random))
-    if req.hba1c is not None:
-        flags.append(_check_hba1c(req.hba1c))
-    if req.cholesterol_total is not None:
-        flags.append(_check_cholesterol_total(req.cholesterol_total))
-    if req.cholesterol_ldl is not None:
-        flags.append(_check_ldl(req.cholesterol_ldl))
-    if req.cholesterol_hdl is not None:
-        flags.append(_check_hdl(req.cholesterol_hdl))
-    if req.triglycerides is not None:
-        flags.append(_check_triglycerides(req.triglycerides))
-    if req.uric_acid is not None:
-        flags.append(_check_uric_acid(req.uric_acid))
-    if req.creatinine is not None:
-        flags.append(_check_creatinine(req.creatinine))
-    if req.egfr is not None:
-        flags.append(_check_egfr(req.egfr))
-    if req.hemoglobin is not None:
-        flags.append(_check_hemoglobin(req.hemoglobin))
-    if req.waist_circumference is not None:
-        flags.append(_check_waist(req.waist_circumference))
     return flags
 
 
@@ -343,16 +218,6 @@ def _doc_to_response(doc_id: str, d: dict) -> VitalsLogResponse:
         glucose_fasting=d.get("glucose_fasting"),
         glucose_post_meal=d.get("glucose_post_meal"),
         glucose_random=d.get("glucose_random"),
-        hba1c=d.get("hba1c"),
-        cholesterol_total=d.get("cholesterol_total"),
-        cholesterol_ldl=d.get("cholesterol_ldl"),
-        cholesterol_hdl=d.get("cholesterol_hdl"),
-        triglycerides=d.get("triglycerides"),
-        uric_acid=d.get("uric_acid"),
-        creatinine=d.get("creatinine"),
-        egfr=d.get("egfr"),
-        hemoglobin=d.get("hemoglobin"),
-        waist_circumference=d.get("waist_circumference"),
         notes=d.get("notes"),
         device_source=d.get("device_source"),
         measured_at=measured_at,
@@ -361,44 +226,74 @@ def _doc_to_response(doc_id: str, d: dict) -> VitalsLogResponse:
     )
 
 
-# ── CRUD ──────────────────────────────────────────────────────────────────────
+# ── CRUD Operations ────────────────────────────────────────────────────────────
 
 async def log_vitals(uid: str, req: VitalsLogRequest, db: firestore.AsyncClient) -> VitalsLogResponse:
-    now         = datetime.datetime.now(datetime.UTC)
+    now = datetime.datetime.now(timezone.utc)
     measured_at = req.measured_at or now
     vital_types = _infer_vital_types(req)
     flags       = _compute_flags(req)
 
-    bmi, bmi_category = None, None
-    if req.weight and req.height:
-        bmi, bmi_category = _compute_bmi(req.weight, req.height)
-        await db.collection(settings.PATIENTS_COLLECTION).document(uid).update({
-            "height": req.height,
-            "weight": req.weight,
-        })
+    effective_weight = req.weight
+    effective_height = req.height
 
-    # Only store non-None vital values — keeps documents lean
+    # If only weight or only height is provided, fetch the other from patient profile to compute BMI
+    if (effective_weight and not effective_height) or (effective_height and not effective_weight):
+        try:
+            pat_snap = await db.collection(settings.PATIENTS_COLLECTION).document(uid).get()
+            if pat_snap.exists:
+                pat_data = pat_snap.to_dict() or {}
+                if not effective_height and pat_data.get("height"):
+                    effective_height = float(pat_data["height"])
+                if not effective_weight and pat_data.get("weight"):
+                    effective_weight = float(pat_data["weight"])
+        except Exception:
+            pass
+
+    bmi, bmi_category = None, None
+    if effective_weight and effective_height:
+        bmi, bmi_category = _compute_bmi(effective_weight, effective_height)
+
+    # Sync patient profile
+    profile_update: dict = {}
+    if req.height is not None:
+        profile_update["height"] = req.height
+    if req.weight is not None:
+        profile_update["weight"] = req.weight
+    if bmi is not None:
+        profile_update["bmi"] = bmi
+        profile_update["bmi_category"] = bmi_category
+
+    if profile_update:
+        await db.collection(settings.PATIENTS_COLLECTION).document(uid).set(
+            profile_update,
+            merge=True,
+        )
+
     vital_data: dict = {}
     for field in [
         "systolic", "diastolic", "heart_rate", "spo2", "temperature",
         "weight", "height", "respiratory_rate",
         "glucose_fasting", "glucose_post_meal", "glucose_random",
-        "hba1c", "cholesterol_total", "cholesterol_ldl", "cholesterol_hdl",
-        "triglycerides", "uric_acid", "creatinine", "egfr",
-        "hemoglobin", "waist_circumference",
     ]:
         val = getattr(req, field)
         if val is not None:
             vital_data[field] = val
 
+    # Include effective height if weight was logged and height is known
+    if "height" not in vital_data and effective_height is not None:
+        vital_data["height"] = effective_height
+
     if bmi is not None:
         vital_data["bmi"]          = bmi
         vital_data["bmi_category"] = bmi_category
+        vital_data["category"]     = bmi_category
 
     data = {
         "patientId":     uid,
         "vital_types":   vital_types,
         "measured_at":   measured_at,
+        "recordedAt":    measured_at,  # ensures legacy /profile/vitals/history compatibility
         "logged_at":     now,
         "device_source": (req.device_source or DeviceSource.manual).value,
         "flags":         [f.model_dump() for f in flags],
@@ -420,33 +315,69 @@ async def log_vitals(uid: str, req: VitalsLogRequest, db: firestore.AsyncClient)
         measured_at=measured_at,
         logged_at=now,
         flags=flags,
-        **{k: v for k, v in vital_data.items() if k not in ("bmi", "bmi_category")},
+        **{k: v for k, v in vital_data.items() if k not in ("bmi", "bmi_category", "category")},
     )
 
 
 async def list_vitals(
     uid: str,
-    vital_type: Optional[str],
-    limit: int,
-    db: firestore.AsyncClient,
-) -> list[VitalsLogResponse]:
+    vital_type: Optional[str] = None,
+    from_date: Optional[datetime.date] = None,
+    to_date: Optional[datetime.date] = None,
+    cursor: Optional[str] = None,
+    limit: int = 50,
+    db: Optional[firestore.AsyncClient] = None,
+) -> VitalsListResponse:
     query = db.collection(settings.VITALS_COLLECTION).where("patientId", "==", uid)
     if vital_type:
         if vital_type not in VITAL_FIELD_MAP:
-            raise ValueError(f"Unknown vital_type: {vital_type}")
+            raise ValueError(f"Unknown vital_type: '{vital_type}'. Valid values: {list(VITAL_FIELD_MAP)}")
         query = query.where("vital_types", "array_contains", vital_type)
-    query = query.order_by("measured_at", direction=firestore.Query.DESCENDING).limit(limit)
+
+    if from_date:
+        from_dt = datetime.datetime.combine(from_date, datetime.time.min, tzinfo=timezone.utc)
+        query = query.where("measured_at", ">=", from_dt)
+
+    if to_date:
+        to_dt = datetime.datetime.combine(to_date, datetime.time.max, tzinfo=timezone.utc)
+        query = query.where("measured_at", "<=", to_dt)
+
+    if cursor:
+        try:
+            cursor_dt = datetime.datetime.fromtimestamp(float(cursor), tz=timezone.utc) - timedelta(microseconds=1)
+            query = query.where("measured_at", "<=", cursor_dt)
+        except Exception:
+            pass
+
+    query = query.order_by("measured_at", direction=firestore.Query.DESCENDING).limit(limit + 1)
     docs  = await query.get()
-    return [_doc_to_response(doc.id, doc.to_dict()) for doc in docs]
+
+    has_more = len(docs) > limit
+    page_docs = docs[:limit]
+    items = [_doc_to_response(doc.id, doc.to_dict()) for doc in page_docs]
+
+    next_cursor = None
+    if has_more and items:
+        last_dt = items[-1].measured_at
+        if last_dt.tzinfo is None:
+            last_dt = last_dt.replace(tzinfo=timezone.utc)
+        next_cursor = str(last_dt.timestamp())
+
+    return VitalsListResponse(
+        items=items,
+        next_cursor=next_cursor,
+        has_more=has_more,
+        total_count=len(items),
+    )
 
 
 async def get_latest_vitals(uid: str, db: firestore.AsyncClient) -> list[VitalLatestResponse]:
-    """One latest reading per vital type — scans the most recent 200 entries."""
+    """One latest reading per vital type — scans the most recent entries."""
     docs = await (
         db.collection(settings.VITALS_COLLECTION)
         .where("patientId", "==", uid)
         .order_by("measured_at", direction=firestore.Query.DESCENDING)
-        .limit(200)
+        .limit(100)
         .get()
     )
 
@@ -489,10 +420,8 @@ async def get_vital_trend(
     if vital_type not in VITAL_FIELD_MAP:
         raise ValueError(f"Unknown vital_type: '{vital_type}'. Valid values: {list(VITAL_FIELD_MAP)}")
 
-    since = datetime.datetime.now(datetime.UTC) - datetime.timedelta(days=days)
+    since = datetime.datetime.now(timezone.utc) - datetime.timedelta(days=days)
 
-    # Compound query: array_contains + range filter requires a Firestore composite index
-    # Index: (patientId ASC, vital_types ARRAY, measured_at ASC)
     docs = await (
         db.collection(settings.VITALS_COLLECTION)
         .where("patientId", "==", uid)

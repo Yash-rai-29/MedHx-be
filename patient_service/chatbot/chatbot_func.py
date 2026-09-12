@@ -19,31 +19,25 @@ from patient_service.chatbot.chatbot_model import (
 )
 from patient_service.chatbot.chatbot_tools import execute_tool, try_tool_call
 
-_RAG_TOP_K         = 5      # retrieve more candidates before threshold filtering
-_RAG_SIM_THRESHOLD = 0.20   # lowered: 0.35 was too strict for varied phrasing
+_RAG_TOP_K         = 5      # retrieve candidates before threshold filtering
+_RAG_SIM_THRESHOLD = 0.20   # cosine similarity threshold
 _HISTORY_WINDOW    = 10
 
 _SYSTEM_PROMPT = (
     "You are an empathetic, professional AI Health Companion.\n"
     "You can help with: answering health questions from the patient's uploaded reports, "
-    "listing their documents, and managing reminders (create, pause, delete).\n\n"
+    "logging and tracking vital signs (blood pressure, blood sugar, weight, height, heart rate, temperature, SpO2), "
+    "listing their documents and consultation recordings, and managing medication reminders.\n\n"
     "Follow these rules:\n"
-    "1. GROUNDING: Base answers on the provided report context when available. "
+    "1. GROUNDING: Base answers strictly on the provided report context when available. "
     "If no relevant context exists, say so honestly.\n"
     "2. NON-DIAGNOSTIC: Never make a definitive diagnosis. Use phrasing like 'may indicate', 'suggests'.\n"
     "3. SAFETY: Remind the patient to consult their doctor for any medical decisions.\n"
     "4. CLARITY: Use plain language — avoid unexplained medical jargon.\n"
-    "5. CAPABILITY: If the patient asks to create or manage a reminder and it was not already "
-    "handled by a tool, acknowledge that reminder management is supported and ask them to "
-    "rephrase (e.g. 'Set a daily reminder at 9 AM').\n"
-    "6. REMINDER DETAILS GATHERING: Before calling the `create_reminder` tool, you must make sure "
-    "you have identified the following details. If any of these are missing from the user's initial request, "
-    "do NOT guess or use default placeholders; instead, ask the user to clarify:\n"
-    "   - What is the title or medicine name of the reminder?\n"
-    "   - Is it a medication reminder (medicine) or a doctor visit/follow-up reminder (follow_up)?\n"
-    "   - What is the exact time of day (e.g., 9:00 AM, 10:00 PM)?\n"
-    "   - For medicine reminders: What is the dosage (e.g., '1 tablet', '500mg') and instructions (e.g., 'after meals')?\n"
-    "   - Does the reminder repeat (recurrence like daily/weekly), and if so, is there an end date?\n"
+    "5. VITALS & ACTIONS: When confirming vital logging or tool execution, provide clear, encouraging feedback "
+    "and highlight any abnormal values gently.\n"
+    "6. DETAILS GATHERING: If the user asks to log a vital or set a reminder but key numbers or times "
+    "are missing, politely ask a single clarifying question.\n"
 )
 
 
@@ -66,11 +60,9 @@ async def _rag_context(uid: str, prompt: str, db: firestore.AsyncClient) -> tupl
     """
     Tenant-isolated RAG retrieval.
 
-    Primary path: Firestore Vector Search on document_chunks — finds the most
-    relevant passage per document without loading all embeddings into memory.
-
-    Fallback: in-memory cosine similarity against the document-level embedding
-    (covers documents processed before chunking was introduced).
+    Primary path: Firestore Vector Search on document_chunks.
+    Fallback: in-memory cosine similarity against completed documents.
+    Does NOT force irrelevant documents into context if similarity is below threshold.
     """
     prompt_vector = await async_generate_embeddings(prompt, task_type="RETRIEVAL_QUERY")
 
@@ -86,13 +78,12 @@ async def _rag_context(uid: str, prompt: str, db: firestore.AsyncClient) -> tupl
                 vector_field="embedding",
                 query_vector=Vector(prompt_vector),
                 distance_measure=DistanceMeasure.COSINE,
-                limit=_RAG_TOP_K * 3,   # over-fetch; dedup by doc_id trims to TOP_K
+                limit=_RAG_TOP_K * 3,
             )
             .get()
         )
 
         if chunk_snap:
-            # Results are ordered nearest-first. Keep the first (best) chunk per doc.
             seen: set[str] = set()
             context_parts: list[str]         = []
             citations:     list[ChatCitation] = []
@@ -121,7 +112,7 @@ async def _rag_context(uid: str, prompt: str, db: firestore.AsyncClient) -> tupl
     except Exception as e:
         logger.warning(f"Vector search unavailable, using in-memory fallback: {e}")
 
-    # ── Fallback: load completed docs and run cosine similarity in Python ───────
+    # ── Fallback: in-memory cosine similarity on completed documents ───────────
     docs_snap = await (
         db.collection(settings.DOCUMENTS_COLLECTION)
         .where("patientId", "==", uid)
@@ -149,8 +140,7 @@ async def _rag_context(uid: str, prompt: str, db: firestore.AsyncClient) -> tupl
         if total == 0:
             return "The patient has not uploaded any medical documents yet.", []
         return (
-            f"The patient has {total} document(s) but none have finished processing yet. "
-            "Cannot retrieve document content.",
+            f"The patient has {total} document(s) but none have finished processing yet.",
             [],
         )
 
@@ -175,14 +165,6 @@ async def _rag_context(uid: str, prompt: str, db: firestore.AsyncClient) -> tupl
             filename=doc.get("filename"), type=doc["doc_type"],
         ))
 
-    if not context_parts and ranked:
-        _, doc = ranked[0]
-        context_parts.append(
-            f"Document (low relevance match): {doc['title']}\n"
-            f"Summary: {doc['summary']}\n"
-            f"Report text: {doc['raw_text'][:800]}\n"
-        )
-
     context_str = "\n---\n".join(context_parts) if context_parts else "No relevant records found for this question."
     return context_str, citations
 
@@ -201,7 +183,6 @@ def _parse_citations(raw: list) -> list[ChatCitation]:
         if isinstance(s, dict) and s.get("id"):
             out.append(ChatCitation(id=s["id"], title=s.get("title", ""), filename=s.get("filename"), type=s.get("type")))
         elif isinstance(s, str):
-            # back-compat: old sessions stored plain strings
             out.append(ChatCitation(id="", title=s, type=None))
     return out
 
@@ -231,9 +212,26 @@ def _parse_messages(raw: list[dict]) -> list[ChatMessage]:
 # ══════════════════════════════════════════════════════════════
 
 async def answer_patient_query(uid: str, prompt: str, db: firestore.AsyncClient) -> ChatResponse:
-    """Single-turn RAG query. Does not persist to any session."""
-    context_str, sources = await _rag_context(uid, prompt, db)
+    """Single-turn RAG / tool query. Does not persist to any session."""
+    today = datetime.date.today().isoformat()
+    tool_result = await try_tool_call(prompt, "", today)
 
+    if tool_result and tool_result[0] == "tool":
+        _, tool_name, tool_args = tool_result
+        tool_output = await execute_tool(tool_name, tool_args, uid, db)
+        reply = await async_generate_gemini_content(
+            f"{_SYSTEM_PROMPT}\n"
+            f"--- Tool Result ({tool_name}) ---\n{tool_output}\n\n"
+            f"Patient asked: {prompt}\n\n"
+            "Respond naturally and helpfully based on the tool result above.",
+            json_response=False,
+        )
+        return ChatResponse(reply=reply, sources=[])
+
+    elif tool_result and tool_result[0] == "text":
+        return ChatResponse(reply=tool_result[1], sources=[])
+
+    context_str, sources = await _rag_context(uid, prompt, db)
     reply = await async_generate_gemini_content(
         f"{_SYSTEM_PROMPT}\n"
         f"--- Patient Medical Context ---\n{context_str}\n\n"
@@ -272,7 +270,7 @@ async def create_chat_session(
     await db.collection(settings.CHAT_SESSIONS_COLLECTION).document(session_id).set({
         "id":         session_id,
         "patient_id": patient_id,
-        "title":      title or None,   # None until first message generates it
+        "title":      title or None,
         "messages":   [],
         "created_at": now,
         "updated_at": now,
@@ -435,26 +433,74 @@ async def stream_patient_query(
 ) -> AsyncGenerator[str, None]:
     """
     SSE generator for stateless single-turn queries.
-    Emits: sources → chunk* → done  (or error on failure).
+    Emits: thinking → (tool_call/result | sources) → chunk* → done
     """
+    yield _sse("thinking", status="Understanding your question...")
+    today = datetime.date.today().isoformat()
+
     try:
-        context_str, sources = await _rag_context(uid, prompt, db)
+        tool_result = await try_tool_call(prompt, "", today)
     except Exception as e:
-        yield _sse("error", message=f"Failed to retrieve medical context: {e}")
+        logger.error(f"Tool check failed: {e}", exc_info=True)
+        yield _sse("error", error_type="TOOL_CHECK_ERROR", message=f"Failed evaluating tools: {e}")
         return
 
-    yield _sse("sources", sources=sources)
+    sources: list[ChatCitation] = []
 
-    gemini_prompt = (
-        f"{_SYSTEM_PROMPT}\n"
-        f"--- Patient Medical Context ---\n{context_str}\n\n"
-        f"--- Patient Question ---\n{prompt}\n\nResponse:"
-    )
+    if tool_result and tool_result[0] == "tool":
+        _, tool_name, tool_args = tool_result
+        yield _sse("thinking", status=f"Executing {tool_name.replace('_', ' ')}...")
+        yield _sse("tool_call", tool=tool_name, args=tool_args)
+        try:
+            tool_output = await execute_tool(tool_name, tool_args, uid, db)
+        except Exception as e:
+            logger.error(f"Tool execution failed: {e}", exc_info=True)
+            yield _sse("error", error_type="TOOL_EXECUTION_ERROR", message=f"Tool execution failed: {e}")
+            return
+        yield _sse("tool_result", tool=tool_name, output=tool_output)
+        yield _sse("thinking", status="Formulating response...")
+        gemini_prompt = (
+            f"{_SYSTEM_PROMPT}\n"
+            f"--- Tool Result ({tool_name}) ---\n{tool_output}\n\n"
+            f"Patient asked: {prompt}\n\n"
+            "Respond naturally and helpfully based on the tool result above."
+        )
+
+    elif tool_result and tool_result[0] == "text":
+        clarification = tool_result[1]
+        yield _sse("chunk", content=clarification)
+        yield _sse("done")
+        return
+
+    else:
+        yield _sse("thinking", status="Searching medical reports and records...")
+        try:
+            context_str, sources = await _rag_context(uid, prompt, db)
+        except Exception as e:
+            logger.error(f"RAG context retrieval failed: {e}", exc_info=True)
+            yield _sse("error", error_type="RAG_RETRIEVAL_ERROR", message=f"Failed retrieving medical context: {e}")
+            return
+
+        yield _sse("sources", sources=[c.model_dump() for c in sources])
+        yield _sse("thinking", status="Formulating response...")
+        gemini_prompt = (
+            f"{_SYSTEM_PROMPT}\n"
+            f"--- Patient Medical Context ---\n{context_str}\n\n"
+            f"--- Patient Question ---\n{prompt}\n\nResponse:"
+        )
+
     try:
         async for chunk in stream_gemini_content(gemini_prompt):
-            yield _sse("chunk", content=chunk)
+            if isinstance(chunk, dict):
+                if chunk.get("type") == "thought":
+                    yield _sse("thinking", status=chunk["content"])
+                else:
+                    yield _sse("chunk", content=chunk["content"])
+            elif isinstance(chunk, str):
+                yield _sse("chunk", content=chunk)
     except Exception as e:
-        yield _sse("error", message=f"Streaming interrupted: {e}")
+        logger.error(f"Streaming failed: {e}", exc_info=True)
+        yield _sse("error", error_type="GEMINI_STREAM_ERROR", message=f"Streaming interrupted: {e}")
         return
 
     yield _sse("done")
@@ -469,19 +515,27 @@ async def stream_session_ask(
 ) -> AsyncGenerator[str, None]:
     """
     SSE generator for session-aware multi-turn queries.
-    Emits: sources → chunk* → done  (or error on failure).
+    Emits: thinking → (tool_call/result | sources) → chunk* → done
     Persists both turns to Firestore after the stream completes.
     """
     doc_ref = db.collection(settings.CHAT_SESSIONS_COLLECTION).document(session_id)
-    snap    = await doc_ref.get()
+    try:
+        snap = await doc_ref.get()
+    except Exception as e:
+        yield _sse("error", error_type="DATABASE_ERROR", message=f"Failed accessing chat session: {e}")
+        return
+
     if not snap.exists:
-        yield _sse("error", message=f"Session {session_id} not found.")
+        yield _sse("error", error_type="SESSION_NOT_FOUND", message=f"Session {session_id} not found.")
         return
     d = snap.to_dict()
     try:
         _get_session(d, patient_id, session_id)
     except PermissionError as e:
-        yield _sse("error", message=str(e))
+        yield _sse("error", error_type="PERMISSION_DENIED", message=str(e))
+        return
+    except ValueError as e:
+        yield _sse("error", error_type="SESSION_NOT_FOUND", message=str(e))
         return
 
     messages_raw  = d.get("messages", [])
@@ -492,19 +546,29 @@ async def stream_session_ask(
     history_str = "\n".join(history_lines) if history_lines else ""
     today       = datetime.date.today().isoformat()
 
-    # 1. Try tool calling — returns ("tool", name, args) | ("text", question) | None
+    # 1. Emit thinking & evaluate tool calling
+    yield _sse("thinking", status="Understanding your request...")
     sources: list[ChatCitation] = []
-    tool_result = await try_tool_call(prompt, history_str, today)
+
+    try:
+        tool_result = await try_tool_call(prompt, history_str, today)
+    except Exception as e:
+        logger.error(f"Tool evaluation failed: {e}", exc_info=True)
+        yield _sse("error", error_type="TOOL_CHECK_ERROR", message=f"Tool check failed: {e}")
+        return
 
     if tool_result and tool_result[0] == "tool":
         _, tool_name, tool_args = tool_result
-        yield _sse("tool_call", tool=tool_name)
+        yield _sse("thinking", status=f"Executing {tool_name.replace('_', ' ')}...")
+        yield _sse("tool_call", tool=tool_name, args=tool_args)
         try:
             tool_output = await execute_tool(tool_name, tool_args, patient_id, db)
         except Exception as e:
-            yield _sse("error", message=f"Tool execution failed: {e}")
+            logger.error(f"Tool execution error: {e}", exc_info=True)
+            yield _sse("error", error_type="TOOL_EXECUTION_ERROR", message=f"Tool execution failed: {e}")
             return
         yield _sse("tool_result", tool=tool_name, output=tool_output)
+        yield _sse("thinking", status="Preparing confirmation...")
         gemini_prompt = (
             f"{_SYSTEM_PROMPT}\n"
             f"--- Tool Result ({tool_name}) ---\n{tool_output}\n\n"
@@ -529,12 +593,15 @@ async def stream_session_ask(
 
     else:
         # 2. Fall back to RAG for medical questions
+        yield _sse("thinking", status="Searching medical reports and records...")
         try:
             context_str, sources = await _rag_context(patient_id, prompt, db)
         except Exception as e:
-            yield _sse("error", message=f"Failed to retrieve medical context: {e}")
+            logger.error(f"RAG retrieval error: {e}", exc_info=True)
+            yield _sse("error", error_type="RAG_RETRIEVAL_ERROR", message=f"Failed retrieving medical context: {e}")
             return
         yield _sse("sources", sources=[c.model_dump() for c in sources])
+        yield _sse("thinking", status="Formulating response...")
         gemini_prompt = (
             f"{_SYSTEM_PROMPT}\n"
             f"--- Patient Medical Context ---\n{context_str}\n\n"
@@ -542,14 +609,22 @@ async def stream_session_ask(
             f"--- Patient Question ---\n{prompt}\n\nResponse:"
         )
 
-    # 3. Stream Gemini response
+    # 3. Stream Gemini response with thinking thoughts
     reply_chunks: list[str] = []
     try:
         async for chunk in stream_gemini_content(gemini_prompt, model=model):
-            reply_chunks.append(chunk)
-            yield _sse("chunk", content=chunk)
+            if isinstance(chunk, dict):
+                if chunk.get("type") == "thought":
+                    yield _sse("thinking", status=chunk["content"])
+                else:
+                    reply_chunks.append(chunk["content"])
+                    yield _sse("chunk", content=chunk["content"])
+            elif isinstance(chunk, str):
+                reply_chunks.append(chunk)
+                yield _sse("chunk", content=chunk)
     except Exception as e:
-        yield _sse("error", message=f"Streaming interrupted: {e}")
+        logger.error(f"Gemini streaming error: {e}", exc_info=True)
+        yield _sse("error", error_type="GEMINI_STREAM_ERROR", message=f"Streaming interrupted: {e}")
         return
 
     yield _sse("done")

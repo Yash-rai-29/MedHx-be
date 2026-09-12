@@ -48,8 +48,15 @@ class MockDocumentReference:
         self.path = path or f"docs/{doc_id}"
         self.db_store = db_store if db_store is not None else {}
 
-    async def set(self, data):
-        self.collection_store[self.id] = data
+    async def set(self, data, merge=False):
+        if merge and self.id in self.collection_store:
+            self.collection_store[self.id].update(data)
+        else:
+            self.collection_store[self.id] = dict(data)
+
+    async def delete(self):
+        if self.id in self.collection_store:
+            del self.collection_store[self.id]
 
     async def get(self, transaction=None):
         data = self.collection_store.get(self.id)
@@ -122,9 +129,18 @@ class MockQuery:
             match = True
             for field, op, value in self.filters:
                 val = data.get(field)
+                if val is None:
+                    match = False
+                    break
                 if op == "==" and val != value:
                     match = False
                 elif op == ">" and not (val > value):
+                    match = False
+                elif op == ">=" and not (val >= value):
+                    match = False
+                elif op == "<" and not (val < value):
+                    match = False
+                elif op == "<=" and not (val <= value):
                     match = False
             if match:
                 results.append(MockDocumentSnapshot(doc_id, data))

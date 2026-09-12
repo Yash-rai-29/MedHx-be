@@ -2,7 +2,13 @@ import datetime
 from datetime import UTC
 from google.cloud import firestore
 from common_code.config import settings
+import urllib.parse
+import jwt
+from common_code.firestore import log_audit_event
 from patient_service.profile.profile_model import (
+    DoctorConsultationSummary,
+    DoctorDocumentSummary,
+    DoctorViewResponse,
     PatientProfileResponse,
     PatientProfileUpdateRequest,
     VitalsLogResponse,
@@ -53,13 +59,16 @@ async def get_patient_profile(uid: str, db: firestore.AsyncClient) -> PatientPro
     return PatientProfileResponse(
         uid=user_data.get("uid") or uid,
         name=user_data.get("name"),
-        phone=user_data.get("phone"),
+        country_code=user_data.get("country_code"),
+        phone_number=user_data.get("phone_number"),
         email=user_data.get("email"),
         role=user_data.get("role"),
         language_preference=user_data.get("language_preference"),
         auth_provider=user_data.get("auth_provider"),
         accepted_privacy_policy=user_data.get("accepted_privacy_policy"),
         accepted_terms_of_service=user_data.get("accepted_terms_of_service"),
+        account_status=user_data.get("account_status") or "active",
+        deletion_scheduled_at=user_data.get("deletion_scheduled_at"),
         blood_group=patient_data.get("blood_group"),
         allergies=patient_data.get("allergies", []),
         chronic_conditions=patient_data.get("chronic_conditions", []),
@@ -156,88 +165,264 @@ def compute_indian_bmi_category(bmi: float) -> str:
 
 async def log_patient_vitals(uid: str, height: float, weight: float, db: firestore.AsyncClient) -> VitalsLogResponse:
     """Logs weight and height, computes local BMI, and appends a vitals document."""
-    # BMI = weight (kg) / height^2 (m^2)
     height_meters = height / 100.0
     bmi = round(weight / (height_meters ** 2), 2)
     category = compute_indian_bmi_category(bmi)
-    recorded_at = datetime.datetime.now(UTC)
-    
+    now = datetime.datetime.now(UTC)
+
     vitals_data = {
-        "patientId": uid,
+        "patientId":   uid,
+        "height":      height,
+        "weight":      weight,
+        "bmi":         bmi,
+        "category":    category,
+        "measured_at": now,
+        "logged_at":   now,
+        "vital_types": ["weight_bmi"],
+    }
+
+    doc_ref = await db.collection(settings.VITALS_COLLECTION).add(vitals_data)
+
+    # Store current height/weight in profile for faster medication checks
+    await db.collection(settings.PATIENTS_COLLECTION).document(uid).set({
         "height": height,
         "weight": weight,
-        "bmi": bmi,
-        "category": category,
-        "recordedAt": recorded_at
-    }
-    
-    # Save log
-    doc_ref = await db.collection(settings.VITALS_COLLECTION).add(vitals_data)
-    
-    # Store current height/weight in profile for faster medication checks
-    await db.collection(settings.PATIENTS_COLLECTION).document(uid).update({
-        "height": height,
-        "weight": weight
-    })
-    
+        "bmi":    bmi,
+    }, merge=True)
+
     return VitalsLogResponse(
         id=doc_ref[1].id,
         height=height,
         weight=weight,
         bmi=bmi,
         category=category,
-        recorded_at=recorded_at
+        recorded_at=now,
     )
 
+
 async def get_patient_vitals_history(uid: str, db: firestore.AsyncClient, limit: int = 90) -> list[VitalsLogResponse]:
-    """Retrieves weight/BMI vitals history. Skips entries that lack height/weight (extended vitals docs)."""
+    """Retrieves weight/BMI vitals history for the patient."""
     docs = await (
         db.collection(settings.VITALS_COLLECTION)
         .where("patientId", "==", uid)
-        .order_by("recordedAt", direction=firestore.Query.DESCENDING)
         .limit(limit)
         .get()
     )
-    history = []
+
+    history: list[VitalsLogResponse] = []
     for doc in docs:
         d = doc.to_dict()
-        # Extended vitals documents (new module) won't have recordedAt or weight/bmi — skip them
-        if not d.get("height") or not d.get("weight") or not d.get("recordedAt"):
+        weight = d.get("weight")
+        measured_at = d.get("measured_at") or d.get("recordedAt")
+        if weight is None or measured_at is None:
             continue
+
         history.append(VitalsLogResponse(
             id=doc.id,
-            height=d["height"],
-            weight=d["weight"],
+            height=d.get("height", 0.0),
+            weight=weight,
             bmi=d.get("bmi", 0.0),
-            category=d.get("category", ""),
-            recorded_at=d["recordedAt"],
+            category=d.get("category") or d.get("bmi_category", ""),
+            recorded_at=measured_at,
         ))
-    return history
+
+    history.sort(key=lambda x: x.recorded_at, reverse=True)
+    return history[:limit]
+
+def generate_qr_passport_token(uid: str, email: str) -> tuple[str, datetime.datetime]:
+    """Generates a secure 30-minute signed token for dynamic QR passport scanning."""
+    now = datetime.datetime.now(datetime.UTC)
+    expiry = now + datetime.timedelta(minutes=settings.QR_PASSPORT_TOKEN_EXPIRY_MINUTES)
+    payload = {
+        "sub": uid,
+        "email": (email or "").strip().lower(),
+        "type": "qr_passport",
+        "iat": int(now.timestamp()),
+        "exp": int(expiry.timestamp()),
+    }
+    token = jwt.encode(payload, settings.QR_PASSPORT_SECRET, algorithm="HS256")
+    return token, expiry
+
+
+def verify_qr_passport_token(token: str, email: str) -> dict:
+    """
+    Decodes and validates the 30-minute QR passport token.
+    Enforces signature, expiration, and case-insensitive email match.
+    """
+    if not token or not email:
+        raise ValueError("Token and email are both required for verification.")
+
+    try:
+        payload = jwt.decode(
+            token,
+            settings.QR_PASSPORT_SECRET,
+            algorithms=["HS256"],
+            options={"require": ["exp", "sub", "email", "type"]},
+        )
+    except jwt.ExpiredSignatureError:
+        raise ValueError("QR passport token has expired (valid for 30 minutes). Please ask the patient to refresh their QR code.")
+    except jwt.InvalidTokenError as e:
+        raise ValueError(f"Invalid QR passport token: {e}")
+
+    if payload.get("type") != "qr_passport":
+        raise ValueError("Invalid token type.")
+
+    token_email = (payload.get("email") or "").strip().lower()
+    provided_email = email.strip().lower()
+    if token_email and token_email != provided_email:
+        raise PermissionError("Email mismatch: the provided email does not match the QR passport token.")
+
+    return payload
+
 
 async def get_patient_qr_passport(uid: str, db: firestore.AsyncClient) -> QRPassportResponse:
-    """Constructs restricted emergency metadata payload for emergency QR scanning."""
+    """Constructs dynamic 30-minute time-limited emergency metadata and URL for QR scanning."""
     # Fetch identity
     user_doc = await db.collection(settings.USERS_COLLECTION).document(uid).get()
     if not user_doc.exists:
         raise ValueError("User not found.")
     user_data = user_doc.to_dict()
-    
+    user_email = user_data.get("email") or ""
+
     # Fetch medical
     prof = await get_patient_profile(uid, db)
-    
-    # Resolve the redirect URL dynamically using configured service domain or local fallback
-    service_url = settings.SERVICE_URL or "http://localhost:8001"
-    qr_redirect_url = f"{service_url}/profile/sos/{uid}"
-    
+
+    # Generate 30-minute signed token
+    token, expires_at = generate_qr_passport_token(uid, user_email)
+
+    # Construct frontend redirect URL pointing to https://medhx-ai.vercel.app
+    frontend_base = settings.FRONTEND_WEB_URL.rstrip("/")
+    encoded_email = urllib.parse.quote(user_email)
+    qr_redirect_url = f"{frontend_base}/doctor-view?token={token}&email={encoded_email}"
+
     return QRPassportResponse(
         name=user_data.get("name", "Unknown Patient"),
+        email=user_email,
         blood_group=prof.blood_group,
         allergies=prof.allergies,
         chronic_conditions=prof.chronic_conditions,
         current_medications=prof.current_medications,
         emergency_contact=prof.emergency_contact,
-        qr_redirect_url=qr_redirect_url
+        token=token,
+        token_expires_at=expires_at,
+        validity_minutes=settings.QR_PASSPORT_TOKEN_EXPIRY_MINUTES,
+        qr_redirect_url=qr_redirect_url,
     )
+
+
+async def verify_and_get_doctor_view(
+    token: str,
+    email: str,
+    db: firestore.AsyncClient,
+) -> DoctorViewResponse:
+    """
+    Validates 30-minute QR token + email, retrieves full patient clinical summary
+    (demographics, baseline, recent vitals, consultations, and test reports) for Doctor Web Portal.
+    """
+    payload = verify_qr_passport_token(token, email)
+    uid = payload["sub"]
+    exp_ts = payload["exp"]
+    expires_at = datetime.datetime.fromtimestamp(exp_ts, tz=datetime.UTC)
+    now = datetime.datetime.now(datetime.UTC)
+    remaining_sec = max(0, int((expires_at - now).total_seconds()))
+
+    # 1. Identity & Profile
+    user_doc = await db.collection(settings.USERS_COLLECTION).document(uid).get()
+    if not user_doc.exists:
+        raise ValueError("Patient user record not found.")
+    user_data = user_doc.to_dict() or {}
+    prof = await get_patient_profile(uid, db)
+
+    # 2. Recent Vitals (up to 5 latest measurements)
+    vitals_snaps = await (
+        db.collection(settings.VITALS_COLLECTION)
+        .where("patientId", "==", uid)
+        .order_by("measured_at", direction=firestore.Query.DESCENDING)
+        .limit(5)
+        .get()
+    )
+    recent_vitals = []
+    for vs in vitals_snaps:
+        vd = vs.to_dict()
+        vd["id"] = vs.id
+        recent_vitals.append(vd)
+
+    # 3. Recent Consultations (up to 5 latest)
+    consults_snaps = await (
+        db.collection(settings.AUDIO_CONSULTATIONS_COLLECTION)
+        .where("patientId", "==", uid)
+        .order_by("created_at", direction=firestore.Query.DESCENDING)
+        .limit(5)
+        .get()
+    )
+    recent_consultations = []
+    for cs in consults_snaps:
+        cd = cs.to_dict()
+        c_at = cd.get("created_at") or cd.get("createdAt")
+        date_str = c_at.strftime("%d %b %Y") if isinstance(c_at, datetime.datetime) else str(c_at or "")[:10]
+        recent_consultations.append(
+            DoctorConsultationSummary(
+                id=cs.id,
+                title=cd.get("title") or "Audio Consultation",
+                doctor_name=cd.get("doctor_name") or "AI Clinical Assistant",
+                date=date_str,
+                summary=cd.get("summary") or cd.get("chief_complaint"),
+                diagnoses=cd.get("key_diagnoses") or cd.get("diagnoses") or [],
+                medications=cd.get("medicines") or cd.get("prescriptions") or [],
+            )
+        )
+
+    # 4. Recent Documents & Lab Reports (up to 5 latest)
+    docs_snaps = await (
+        db.collection(settings.DOCUMENTS_COLLECTION)
+        .where("patientId", "==", uid)
+        .order_by("createdAt", direction=firestore.Query.DESCENDING)
+        .limit(5)
+        .get()
+    )
+    recent_documents = []
+    for ds in docs_snaps:
+        dd = ds.to_dict()
+        d_at = dd.get("createdAt") or dd.get("created_at")
+        date_str = d_at.strftime("%d %b %Y") if isinstance(d_at, datetime.datetime) else str(d_at or "")[:10]
+        recent_documents.append(
+            DoctorDocumentSummary(
+                id=ds.id,
+                title=dd.get("title") or "Medical Document",
+                type=dd.get("type"),
+                date=date_str,
+                summary=dd.get("summary"),
+                abnormal_labs=dd.get("abnormal_labs") or [],
+            )
+        )
+
+    await log_audit_event(
+        actor=f"doctor_qr_scan:{email}",
+        action="DOCTOR_VIEW_PATIENT_RECORDS",
+        target=uid,
+        details={"token_exp": exp_ts, "patient_name": user_data.get("name")},
+    )
+
+    return DoctorViewResponse(
+        valid=True,
+        patient_id=uid,
+        name=user_data.get("name", "Unknown Patient"),
+        email=user_data.get("email"),
+        phone=user_data.get("phone"),
+        age=prof.age,
+        gender=prof.gender,
+        blood_group=prof.blood_group,
+        emergency_contact=prof.emergency_contact,
+        allergies=prof.allergies,
+        chronic_conditions=prof.chronic_conditions,
+        current_medications=prof.current_medications,
+        recent_vitals=recent_vitals,
+        recent_consultations=recent_consultations,
+        recent_documents=recent_documents,
+        token_expires_at=expires_at,
+        remaining_seconds=remaining_sec,
+    )
+
 
 
 async def update_fcm_token(
